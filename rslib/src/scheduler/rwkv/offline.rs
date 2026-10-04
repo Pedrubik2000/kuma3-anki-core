@@ -11,8 +11,10 @@
 //! consume them: before a review queue is built, and before deck counts are
 //! computed.
 //!
-//! Nothing here writes to cards or the revlog. If anything fails, the scores
-//! are simply not installed and the standard scheduler order applies.
+//! Nothing here writes to cards. The one write is to the revlog: an answer to
+//! a review card that was already answered today is recorded with the kind the
+//! desktop records (`rwkv_offline_same_day_review_kind`). If scoring fails, the
+//! installed scores are cleared and the standard scheduler order applies.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -257,18 +259,24 @@ impl Collection {
 
     /// Called before a review queue is built.
     pub(crate) fn rwkv_offline_before_queue_build(&mut self, deck_id: DeckId) {
-        self.with_rwkv_offline_runtime("queue build", |col, runtime| {
-            if !col.rwkv_offline_deck_uses_instant(deck_id)? {
-                return Ok(());
-            }
-            col.rwkv_offline_sync_history(runtime)?;
-            let Some(deck) = col.storage.get_deck(deck_id)? else {
-                return Ok(());
+        let scored = self.with_rwkv_offline_runtime("queue build", |col, runtime| {
+            let deck = col.storage.get_deck(deck_id)?;
+            let Some(deck) =
+                deck.filter(|_| matches!(col.rwkv_offline_deck_uses_instant(deck_id), Ok(true)))
+            else {
+                // not an Instant deck: scores left from another deck must not order it
+                return col.set_rwkv_review_queue_score_entries(deck_id, HashMap::new());
             };
+            col.rwkv_offline_sync_history(runtime)?;
             let cards = col.rwkv_offline_scope_scores(runtime, &deck, QUEUE_SCORE_MAX_AGE_SECS)?;
             let entries = col.rwkv_offline_score_entries(&deck, &cards)?;
             col.set_rwkv_review_queue_score_entries(deck_id, entries)
         });
+        if !scored {
+            // Scores from before the failure would still order the queue, and a
+            // card answered since then would keep its old, low score.
+            let _ = self.set_rwkv_review_queue_score_entries(deck_id, HashMap::new());
+        }
     }
 
     /// Called after a card was answered: the retained queue was ordered with
@@ -330,14 +338,17 @@ impl Collection {
         const FILTERED: u32 = 3;
         Ok(match (previous_kind, previous_ease) {
             (1, 1) | (2, 1 | 2) => Some(RELEARNING),
-            (0 | 1 | 2, _) => Some(FILTERED),
+            // 3: an earlier same-day repeat (rows with factor 0, i.e. cramming,
+            // are excluded above). The desktop keeps FILTERED for the third
+            // and later repeats too.
+            (0 | 1 | 2 | 3, _) => Some(FILTERED),
             _ => None,
         })
     }
 
     /// Called before deck counts are computed.
     pub(crate) fn rwkv_offline_before_deck_counts(&mut self) {
-        self.with_rwkv_offline_runtime("deck counts", |col, runtime| {
+        let scored = self.with_rwkv_offline_runtime("deck counts", |col, runtime| {
             col.rwkv_offline_sync_history(runtime)?;
             col.rwkv_offline_install_deck_count_scores_inner(
                 runtime,
@@ -345,43 +356,51 @@ impl Collection {
             )?;
             Ok(())
         });
+        if !scored {
+            self.clear_rwkv_deck_count_scores();
+        }
     }
 
     fn rwkv_offline_enabled(&self) -> bool {
         self.state.rwkv_offline.is_some() || registered_model().is_some()
     }
 
+    /// Run `func` with the runtime. Returns false if it failed, so the caller
+    /// can clear what an earlier run installed; true also when there is no
+    /// runtime (nothing was ever installed).
     fn with_rwkv_offline_runtime(
         &mut self,
         stage: &str,
         func: impl FnOnce(&mut Collection, &mut RwkvOfflineRuntime) -> Result<()>,
-    ) {
+    ) -> bool {
         let mut runtime = match self.state.rwkv_offline.take() {
             Some(runtime) => runtime,
             None => {
                 // The collection was reopened (e.g. after a full sync) since
                 // the client's prepare call.
                 let Some(model_path) = registered_model() else {
-                    return;
+                    return true;
                 };
                 match RwkvOfflineRuntime::load(model_path) {
                     Ok(runtime) => Box::new(runtime),
                     Err(err) => {
                         tracing::warn!(?err, "RWKV offline model failed to load; disabled");
                         *REGISTERED_MODEL.lock().unwrap() = None;
-                        return;
+                        return true;
                     }
                 }
             }
         };
-        if let Err(err) = func(self, &mut runtime) {
+        let result = func(self, &mut runtime);
+        self.state.rwkv_offline = Some(runtime);
+        if let Err(err) = &result {
             tracing::warn!(
                 ?err,
                 stage,
-                "RWKV offline scoring failed; using stored order"
+                "RWKV offline scoring failed; using the standard order"
             );
         }
-        self.state.rwkv_offline = Some(runtime);
+        result.is_ok()
     }
 
     fn rwkv_offline_deck_uses_instant(&mut self, deck_id: DeckId) -> Result<bool> {
