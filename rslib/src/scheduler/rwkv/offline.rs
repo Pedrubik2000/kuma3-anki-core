@@ -15,8 +15,13 @@
 //! a review card that was already answered today is recorded with the kind the
 //! desktop records (`rwkv_offline_same_day_review_kind`). If scoring fails, the
 //! installed scores are cleared and the standard scheduler order applies.
+//!
+//! The model state is also kept in a file next to the collection
+//! (`offline_state.rs`): a new start loads it and replays only the reviews
+//! that came after it, instead of the whole history.
 
 use std::fmt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -30,8 +35,10 @@ use anki_proto::scheduler::RwkvOfflineInstantPassProgress;
 use anki_proto::scheduler::RwkvOfflineInstantPassStepRequest;
 use anki_proto::scheduler::RwkvPrepareOfflineRequest;
 use anki_proto::scheduler::RwkvPrepareOfflineResponse;
+use prost::Message;
 use rusqlite::OptionalExtension;
 
+use super::offline_state;
 use super::*;
 use crate::collection::RwkvReviewQueueScoreEntry;
 use crate::rwkv::ReviewInput;
@@ -48,6 +55,10 @@ const DEFAULT_TARGET_RETENTION: f32 = 0.9;
 /// recomputed once they are this old, even when no review happened.
 const QUEUE_SCORE_MAX_AGE_SECS: i64 = 30;
 const DECK_COUNT_SCORE_MAX_AGE_SECS: i64 = 120;
+/// The state file is rewritten after a full replay, and otherwise once this
+/// many reviews were absorbed since it was written (a start replays at most
+/// these few).
+const SAVE_STATE_AFTER_REVIEWS: u64 = 200;
 
 /// The model path of the last successful `RwkvPrepareOffline`. The runtime
 /// lives in the collection state, which is lost when the collection is
@@ -70,6 +81,8 @@ pub(crate) struct RwkvOfflineRuntime {
     /// Bumped whenever the model state changes; invalidates cached scores.
     generation: u64,
     scopes: HashMap<DeckId, ScopeScores>,
+    /// Review count of the state in the state file, if it holds this one's.
+    saved_review_count: Option<u64>,
 }
 
 impl fmt::Debug for RwkvOfflineRuntime {
@@ -114,7 +127,58 @@ impl RwkvOfflineRuntime {
             checked_at_mod: None,
             generation: 0,
             scopes: HashMap::new(),
+            saved_review_count: None,
         })
+    }
+
+    /// A freshly loaded runtime, with the state from the state file at `path`
+    /// when there is a usable one. Whether that state still fits the
+    /// collection is checked by the next history sync, which replays only
+    /// what is missing (or everything, when the history changed otherwise).
+    fn load_with_saved_state(model_path: PathBuf, path: &Path) -> Result<Self> {
+        let mut runtime = Self::load(model_path)?;
+        if path.exists() {
+            if let Err(err) = runtime.restore_saved_state(path) {
+                tracing::warn!(?err, "saved RWKV offline state not used");
+                runtime.reset()?;
+            }
+        }
+        Ok(runtime)
+    }
+
+    fn restore_saved_state(&mut self, path: &Path) -> std::io::Result<()> {
+        let header = offline_state::header(&self.model_path)?;
+        let saved = offline_state::read(path, &header)?;
+        let identity = RwkvHistoricalReviewIdentity::decode(saved.identity.as_slice())
+            .map_err(std::io::Error::other)?;
+        self.inference.restore_warm_up_snapshot(saved.snapshot)?;
+        self.inference.restore_cache_state(&saved.cache_state)?;
+        self.saved_review_count = Some(identity.review_count);
+        self.identity = Some(identity);
+        self.checked_at_mod = None;
+        self.state_changed();
+        Ok(())
+    }
+
+    /// Writes the current state to the state file at `path`. A failure only
+    /// means the next start replays more.
+    fn save_state(&mut self, path: &Path) {
+        let Some(identity) = self.identity.clone() else {
+            return;
+        };
+        let result = offline_state::header(&self.model_path).and_then(|header| {
+            offline_state::write(
+                path,
+                &header,
+                &identity.encode_to_vec(),
+                &self.inference.warm_up_snapshot(),
+                &self.inference.cache_state(),
+            )
+        });
+        match result {
+            Ok(()) => self.saved_review_count = Some(identity.review_count),
+            Err(err) => tracing::warn!(?err, "RWKV offline state not saved"),
+        }
     }
 
     fn reset(&mut self) -> Result<()> {
@@ -122,6 +186,7 @@ impl RwkvOfflineRuntime {
         self.inference
             .restore_cache_state(&self.initial_cache_state)?;
         self.identity = None;
+        self.saved_review_count = None;
         self.state_changed();
         Ok(())
     }
@@ -196,7 +261,10 @@ impl Collection {
         let model_path = PathBuf::from(input.model_path);
         let mut runtime = match self.state.rwkv_offline.take() {
             Some(runtime) if runtime.model_path == model_path => runtime,
-            _ => Box::new(RwkvOfflineRuntime::load(model_path)?),
+            _ => Box::new(RwkvOfflineRuntime::load_with_saved_state(
+                model_path,
+                &self.rwkv_offline_state_path(),
+            )?),
         };
         // On error the runtime is dropped, and the standard scheduler applies
         // until the next successful prepare.
@@ -377,7 +445,10 @@ impl Collection {
                 let Some(model_path) = registered_model() else {
                     return true;
                 };
-                match RwkvOfflineRuntime::load(model_path) {
+                match RwkvOfflineRuntime::load_with_saved_state(
+                    model_path,
+                    &self.rwkv_offline_state_path(),
+                ) {
                     Ok(runtime) => Box::new(runtime),
                     Err(err) => {
                         tracing::warn!(?err, "RWKV offline model failed to load; disabled");
@@ -471,7 +542,20 @@ impl Collection {
         );
         runtime.checked_at_mod = Some(collection_mod);
         runtime.state_changed();
+        let review_count = runtime.identity.as_ref().map_or(0, |id| id.review_count);
+        let unsaved = match runtime.saved_review_count {
+            Some(saved) if absorbed > 0 => review_count.saturating_sub(saved),
+            _ => u64::MAX,
+        };
+        if unsaved >= SAVE_STATE_AFTER_REVIEWS {
+            runtime.save_state(&self.rwkv_offline_state_path());
+        }
         Ok(replayed)
+    }
+
+    /// The state file: `collection.rwkv-offline` next to the collection.
+    fn rwkv_offline_state_path(&self) -> PathBuf {
+        self.col_path.with_extension("rwkv-offline")
     }
 
     /// Current retrievability of the scoreable cards in `deck` and its

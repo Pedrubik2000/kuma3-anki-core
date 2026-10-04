@@ -101,6 +101,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         status.reviews_replayed,
     );
 
+    // A new start (collection closed and opened again, as when the app
+    // restarts) loads the saved state file instead of replaying the history,
+    // and must give the same scores.
+    let state_file = std::path::Path::new(&args[1]).with_extension("rwkv-offline");
+    let before_reopen = {
+        SchedulerService::rwkv_offline_instant_pass_step(
+            &mut col,
+            RwkvOfflineInstantPassStepRequest::default(),
+        )?;
+        all_scores(&mut col)?
+    };
+    col.close(None)?;
+    let mut col = CollectionBuilder::new(&args[1]).build()?;
+    let start = Instant::now();
+    let reopened = SchedulerService::rwkv_prepare_offline(
+        &mut col,
+        RwkvPrepareOfflineRequest {
+            model_path: args[2].clone(),
+        },
+    )?;
+    let prepare_ms = start.elapsed().as_millis();
+    let after_reopen = {
+        SchedulerService::rwkv_offline_instant_pass_step(
+            &mut col,
+            RwkvOfflineInstantPassStepRequest::default(),
+        )?;
+        all_scores(&mut col)?
+    };
+    println!(
+        "reopen: state file {} KB; {} reviews replayed, prepare {} ms; {} scores, equal to before: {}",
+        std::fs::metadata(&state_file).map_or(0, |m| m.len() / 1024),
+        reopened.reviews_replayed,
+        prepare_ms,
+        after_reopen.len(),
+        before_reopen.len() == after_reopen.len()
+            && before_reopen
+                .iter()
+                .zip(&after_reopen)
+                .all(|(a, b)| a.0 == b.0 && (a.1 - b.1).abs() < 1e-5),
+    );
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
@@ -201,29 +242,41 @@ fn answer_check(
     }
     col.close(None)?;
 
-    let mut col = CollectionBuilder::new(col_path).build()?;
-    let prepared = SchedulerService::rwkv_prepare_offline(
-        &mut col,
-        RwkvPrepareOfflineRequest {
-            model_path: model_path.into(),
-            ..Default::default()
-        },
-    )?;
-    DecksService::deck_tree(&mut col, DeckTreeRequest { now })?;
-    let fresh = all_scores(&mut col)?;
-    let max_diff = incremental
-        .iter()
-        .zip(&fresh)
-        .map(|((a_id, a), (b_id, b))| {
-            assert_eq!(a_id, b_id);
-            (a - b).abs()
-        })
-        .fold(0.0f32, f32::max);
-    println!(
-        "fresh replay of {} reviews: {} scores, incremental {} scores, max difference {max_diff:.6}",
-        prepared.reviews_replayed,
-        fresh.len(),
-        incremental.len()
-    );
+    // A new start with the state file (saved before these answers: only the
+    // new reviews are replayed), then one without it (the whole history).
+    let state_file = std::path::Path::new(col_path).with_extension("rwkv-offline");
+    for label in ["start with the state file", "fresh replay"] {
+        if label == "fresh replay" {
+            std::fs::remove_file(&state_file)?;
+        }
+        let mut col = CollectionBuilder::new(col_path).build()?;
+        let prepared = SchedulerService::rwkv_prepare_offline(
+            &mut col,
+            RwkvPrepareOfflineRequest {
+                model_path: model_path.into(),
+            },
+        )?;
+        SchedulerService::rwkv_offline_instant_pass_step(
+            &mut col,
+            RwkvOfflineInstantPassStepRequest::default(),
+        )?;
+        DecksService::deck_tree(&mut col, DeckTreeRequest { now })?;
+        let other = all_scores(&mut col)?;
+        let max_diff = incremental
+            .iter()
+            .zip(&other)
+            .map(|((a_id, a), (b_id, b))| {
+                assert_eq!(a_id, b_id);
+                (a - b).abs()
+            })
+            .fold(0.0f32, f32::max);
+        println!(
+            "{label}: {} reviews replayed, {} scores, incremental {} scores, max difference {max_diff:.6}",
+            prepared.reviews_replayed,
+            other.len(),
+            incremental.len()
+        );
+        col.close(None)?;
+    }
     Ok(())
 }
