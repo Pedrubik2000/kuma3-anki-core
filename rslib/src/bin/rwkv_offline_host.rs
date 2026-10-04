@@ -26,18 +26,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut col = CollectionBuilder::new(&args[1]).build()?;
 
-    if args[2] == "repair" {
-        let start = Instant::now();
-        let repaired = col.repair_stripped_fsrs_memory_states()?;
-        println!(
-            "repaired {repaired} cards in {} ms; a second pass finds {}",
-            start.elapsed().as_millis(),
-            col.repair_stripped_fsrs_memory_states()?
-        );
-        col.close(None)?;
-        return Ok(());
-    }
-
     let start = Instant::now();
     let prepared = SchedulerService::rwkv_prepare_offline(
         &mut col,
