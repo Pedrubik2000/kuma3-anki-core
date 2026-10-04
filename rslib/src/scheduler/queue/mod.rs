@@ -402,6 +402,7 @@ impl Collection {
                 })
                 .unwrap_or(false)
         {
+            self.rwkv_offline_before_queue_build(deck.id);
             self.state.card_queues = Some(self.build_queues(deck.id)?);
         }
 

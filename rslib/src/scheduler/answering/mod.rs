@@ -466,6 +466,17 @@ impl Collection {
 
         let mut revlog_partial =
             updater.apply_study_state(current_state, answer.new_state, answer.rating)?;
+        if answer.rwkv_review_kind.is_none() {
+            let config_active = updater.config.inner.rwkv_review_enabled
+                || updater.config.inner.rwkv_review_instant_order_enabled;
+            answer.rwkv_review_kind = self.rwkv_offline_same_day_review_kind(
+                answer.card_id,
+                &current_state,
+                config_active,
+                answer.answered_at,
+                &updater.timing,
+            )?;
+        }
         if let Some(review_kind) = answer.rwkv_review_kind {
             require!(review_kind <= 3, "invalid RWKV review kind");
             revlog_partial.set_review_kind(match review_kind {

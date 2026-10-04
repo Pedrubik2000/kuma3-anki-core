@@ -325,7 +325,9 @@ impl crate::services::SchedulerService for Collection {
         &mut self,
         input: scheduler::CardAnswer,
     ) -> Result<anki_proto::collection::OpChanges> {
-        self.answer_card(&mut input.into()).map(Into::into)
+        let output = self.answer_card(&mut input.into())?;
+        self.rwkv_offline_after_answer();
+        Ok(output.into())
     }
 
     fn upgrade_scheduler(&mut self) -> Result<()> {
@@ -1112,6 +1114,20 @@ impl crate::services::SchedulerService for Collection {
         input: anki_proto::scheduler::RwkvHistoricalReviewInputsRequest,
     ) -> Result<anki_proto::scheduler::RwkvHistoricalReviewInputsResponse> {
         Collection::rwkv_historical_review_inputs(self, input)
+    }
+
+    fn rwkv_prepare_offline(
+        &mut self,
+        input: anki_proto::scheduler::RwkvPrepareOfflineRequest,
+    ) -> Result<anki_proto::scheduler::RwkvPrepareOfflineResponse> {
+        Collection::rwkv_prepare_offline(self, input)
+    }
+
+    fn rwkv_offline_instant_pass_step(
+        &mut self,
+        input: anki_proto::scheduler::RwkvOfflineInstantPassStepRequest,
+    ) -> Result<anki_proto::scheduler::RwkvOfflineInstantPassProgress> {
+        Collection::rwkv_offline_instant_pass_step(self, input)
     }
 }
 

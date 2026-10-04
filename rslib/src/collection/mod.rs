@@ -140,6 +140,8 @@ pub struct CollectionState {
     pub(crate) scheduler_info: Option<SchedulerInfo>,
     pub(crate) card_queues: Option<CardQueues>,
     pub(crate) rwkv_retrievability_scores: Option<RwkvRetrievabilityScores>,
+    /// Model state for RWKV-Instant on clients without the desktop's Python.
+    pub(crate) rwkv_offline: Option<Box<crate::scheduler::rwkv::RwkvOfflineRuntime>>,
     pub(crate) fsrs_preset_overlay_cache: Option<FsrsPresetOverlayCache>,
     pub(crate) active_browser_columns: Option<Arc<Vec<browser_table::Column>>>,
     /// True if legacy Python code has executed SQL that has modified the

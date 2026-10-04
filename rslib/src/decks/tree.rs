@@ -333,6 +333,7 @@ impl Collection {
                     count.interday_learning_limit_exempt = 0;
                 }
             }
+            self.rwkv_offline_before_deck_counts();
             let scoped_counts =
                 self.rwkv_review_queue_counts(&counts, &decks_map, &dconf, timing_at_stamp)?;
             add_counts(&mut tree, &counts);

@@ -36,6 +36,9 @@ use crate::search::StateKind;
 use crate::storage::RwkvHistoricalReviewRow;
 
 mod history;
+mod offline;
+
+pub(crate) use offline::RwkvOfflineRuntime;
 
 const RWKV_HISTORY_HASH_DOMAIN: &[u8] = b"anki-rwkv-state-cache-history-v1\0";
 

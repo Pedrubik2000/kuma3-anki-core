@@ -152,6 +152,14 @@ service SchedulerService {
       returns (RwkvHistoricalReviewFingerprintResponse);
   rpc RwkvHistoricalReviewInputs(RwkvHistoricalReviewInputsRequest)
       returns (RwkvHistoricalReviewInputsResponse);
+  // RWKV-Instant for clients without the desktop's Python: loads the model,
+  // replays the review history, and from then on installs the transient score
+  // maps inside the backend. Cheap to call again when nothing changed.
+  rpc RwkvPrepareOffline(RwkvPrepareOfflineRequest)
+      returns (RwkvPrepareOfflineResponse);
+  // Rescores every Instant-enabled deck and installs the deck count scores.
+  rpc RwkvOfflineInstantPassStep(RwkvOfflineInstantPassStepRequest)
+      returns (RwkvOfflineInstantPassProgress);
 }
 
 // Implicitly includes any of the above methods that are not listed in the
@@ -942,6 +950,50 @@ message FsrsIntervalAtRetrievabilityByConfigBatchResponse {
     float interval = 2;
   }
   repeated Item items = 1;
+}
+
+message RwkvPrepareOfflineRequest {
+  string model_path = 1;
+  // Reserved for a persisted state cache; the history is replayed on each
+  // prepare for now.
+  string cache_path = 2;
+  bool all_decks = 3;
+  bool curve_only = 4;
+}
+
+message RwkvPrepareOfflineResponse {
+  uint64 reviews_replayed = 1;
+}
+
+message RwkvOfflineInstantPassStepRequest {
+  bool restart = 1;
+  uint32 budget_millis = 2;
+  bool status_only = 3;
+  uint32 max_cards = 4;
+}
+
+message RwkvOfflineInstantPassProgress {
+  // False until RwkvPrepareOffline has succeeded on this collection.
+  bool available = 1;
+  bool complete = 2;
+  uint32 scored = 3;
+  uint32 total = 4;
+  int64 started_secs = 5;
+  int64 completed_secs = 6;
+  uint32 step_cards = 7;
+  uint32 step_chunks = 8;
+  uint64 step_micros = 9;
+  uint64 rows_micros = 10;
+  uint64 read_micros = 11;
+  uint64 compute_micros = 12;
+  uint64 store_micros = 13;
+  uint64 max_chunk_micros = 14;
+  bool renewed = 15;
+  // Our additions (not in the downloaded app's messages): the size of the
+  // review history the model state holds, and how many reviews this call
+  // replayed (all of them after a restart).
+  uint64 reviews_absorbed = 16;
+  uint64 reviews_replayed = 17;
 }
 
 message RwkvReviewQueueScoresRequest {
