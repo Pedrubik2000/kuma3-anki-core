@@ -155,6 +155,10 @@ impl Collection {
         out.card_properties_invalid +=
             self.repair_foreign_fsrs_memory_states_inner(foreign_cards)?;
 
+        debug!("stripped FSRS memory states");
+        let stripped_cards = self.storage.card_ids_with_stripped_fsrs_state()?;
+        self.repair_stripped_fsrs_memory_states_inner(stripped_cards)?;
+
         debug!("missing decks");
         self.check_missing_deck_names(&mut out)?;
 
