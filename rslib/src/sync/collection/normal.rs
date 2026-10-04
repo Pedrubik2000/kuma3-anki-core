@@ -143,19 +143,6 @@ impl NormalSyncer<'_> {
             Ok(cards) => debug!(cards, "repaired foreign FSRS memory states"),
             Err(err) => tracing::warn!(?err, "repairing foreign FSRS memory states failed"),
         }
-        // a failure here must not fail the sync
-        let stripped_cards = self
-            .col
-            .storage
-            .card_ids_with_stripped_fsrs_state()
-            .unwrap_or_default();
-        match self
-            .col
-            .repair_stripped_fsrs_memory_states_inner(stripped_cards)
-        {
-            Ok(cards) => debug!(cards, "repaired stripped FSRS memory states"),
-            Err(err) => tracing::warn!(?err, "repairing stripped FSRS memory states failed"),
-        }
         debug!("begin stream to server");
         self.send_chunks_to_server(&state).await?;
 

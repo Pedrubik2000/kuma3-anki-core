@@ -169,25 +169,6 @@ where data like '%"s":%' and data not like '%"s_int":%'"#,
             .collect()
     }
 
-    /// Return reviewed cards whose FSRS state has lost its fast component: what
-    /// a card looks like after it has been through a sync.
-    pub(crate) fn card_ids_with_stripped_fsrs_state(&self) -> Result<Vec<CardId>> {
-        self.db
-            .prepare_cached(
-                r#"select id, data from cards
-where type != 0 and data like '%"s":%' and data not like '%"s_fast":%'"#,
-            )?
-            .query_and_then([], |row| -> Result<Option<CardId>> {
-                let data: CardData = row.get(1)?;
-                let is_stripped = data.fsrs_stability.is_some()
-                    && data.fsrs_difficulty.is_some()
-                    && data.fsrs_stability_fast.is_none();
-                Ok(is_stripped.then(|| row.get(0)).transpose()?)
-            })?
-            .filter_map(Result::transpose)
-            .collect()
-    }
-
     pub fn get_card(&self, cid: CardId) -> Result<Option<Card>> {
         self.db
             .prepare_cached(concat!(include_str!("get_card.sql"), " where id = ?"))?
