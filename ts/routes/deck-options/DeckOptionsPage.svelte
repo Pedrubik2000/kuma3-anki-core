@@ -167,11 +167,12 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
         :global(.container-columns) {
             display: grid;
             gap: 0px;
+            grid-template-columns: minmax(0, 1fr);
         }
 
         @include bp.with-breakpoint("lg") {
             :global(.container-columns) {
-                grid-template-columns: repeat(2, 1fr);
+                grid-template-columns: repeat(2, minmax(0, 1fr));
                 gap: 20px;
             }
         }

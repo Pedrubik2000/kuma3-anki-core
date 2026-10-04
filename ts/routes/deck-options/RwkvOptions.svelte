@@ -6,8 +6,13 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     import { DeckId } from "@generated/anki/decks_pb";
     import { UpdateDeckConfigsMode } from "@generated/anki/deck_config_pb";
     import { Empty } from "@generated/anki/generic_pb";
+    import {
+        RwkvOfflineInstantPassProgress,
+        RwkvOfflineInstantPassStepRequest,
+    } from "@generated/anki/scheduler_pb";
     import * as tr from "@generated/ftl";
     import { postProto } from "@generated/post";
+    import { isDesktop } from "@tslib/platform";
     import type Carousel from "bootstrap/js/dist/carousel";
     import type Modal from "bootstrap/js/dist/modal";
 
@@ -37,6 +42,58 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     const reviewFuzzFactorLong = state.reviewFuzzFactorLong;
 
     let forceBuildingRwkvStateCache = false;
+
+    // Phones: the backend's offline layer (rslib/src/scheduler/rwkv/offline.rs)
+    let rebuildingOfflineRwkvState = false;
+    let offlineRwkvStatus = "";
+
+    async function offlineRwkvStep(restart: boolean): Promise<RwkvOfflineInstantPassProgress> {
+        return await postProto(
+            "rwkvOfflineInstantPassStep",
+            new RwkvOfflineInstantPassStepRequest({ restart, statusOnly: !restart }),
+            RwkvOfflineInstantPassProgress,
+        );
+    }
+
+    function offlineRwkvCounts(progress: RwkvOfflineInstantPassProgress): string {
+        const reviews = Number(progress.reviewsAbsorbed).toLocaleString();
+        return `${reviews} reviews absorbed, ${progress.scored.toLocaleString()} cards scored`;
+    }
+
+    async function refreshOfflineRwkvStatus(): Promise<void> {
+        try {
+            const progress = await offlineRwkvStep(false);
+            offlineRwkvStatus = progress.available
+                ? `RWKV is active: ${offlineRwkvCounts(progress)}.`
+                : "RWKV is not active on this device.";
+        } catch (error) {
+            offlineRwkvStatus = `RWKV status unavailable: ${error}`;
+        }
+    }
+
+    async function rebuildOfflineRwkvState(): Promise<void> {
+        rebuildingOfflineRwkvState = true;
+        try {
+            const progress = await offlineRwkvStep(true);
+            if (progress.available) {
+                const replayed = Number(progress.reviewsReplayed).toLocaleString();
+                const seconds = (Number(progress.stepMicros) / 1e6).toFixed(1);
+                offlineRwkvStatus =
+                    `RWKV state rebuilt: ${replayed} reviews in ${seconds} s; ` +
+                    `${progress.scored.toLocaleString()} cards scored.`;
+            } else {
+                offlineRwkvStatus = "RWKV is not active on this device.";
+            }
+        } catch (error) {
+            offlineRwkvStatus = `Rebuild failed: ${error}`;
+        } finally {
+            rebuildingOfflineRwkvState = false;
+        }
+    }
+
+    if (!isDesktop()) {
+        void refreshOfflineRwkvStatus();
+    }
     let recomputingRwkvCalibrationData = false;
     let reschedulingRwkvReviewCards = false;
     $: rwkvActionInProgress =
@@ -203,7 +260,7 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
             </SwitchRow>
         </Item>
 
-        {#if $config.rwkvReviewEnabled}
+        {#if $config.rwkvReviewEnabled && isDesktop()}
             <button
                 class="btn btn-outline-primary"
                 disabled={rwkvActionInProgress}
@@ -347,6 +404,25 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
                 </SettingTitle>
             </SwitchRow>
 
+            {#if !isDesktop()}
+                <h2 class="rwkv-subheading">Maintenance</h2>
+
+                <div class="d-flex flex-wrap gap-2">
+                    <button
+                        class="btn btn-outline-primary"
+                        disabled={rebuildingOfflineRwkvState}
+                        on:click={() => rebuildOfflineRwkvState()}
+                    >
+                        {#if rebuildingOfflineRwkvState}
+                            Rebuilding RWKV State...
+                        {:else}
+                            Rebuild RWKV State
+                        {/if}
+                    </button>
+                </div>
+                <p class="mt-2 mb-0">{offlineRwkvStatus}</p>
+            {/if}
+            {#if isDesktop()}
             <h2 class="rwkv-subheading">Maintenance</h2>
 
             <div class="d-flex flex-wrap gap-2">
@@ -374,7 +450,9 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
                     {/if}
                 </button>
             </div>
+            {/if}
 
+            {#if isDesktop()}
             <h2 class="rwkv-subheading">Compare</h2>
 
             <div class="d-flex flex-wrap gap-2">
@@ -386,6 +464,7 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
                     Compare RWKV with FSRS
                 </button>
             </div>
+            {/if}
         {/if}
     </DynamicallySlottable>
 </TitledContainer>

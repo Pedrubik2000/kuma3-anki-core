@@ -43,11 +43,13 @@ export interface ConfigListEntry {
     current: boolean;
 }
 
+import { isDesktop } from "@tslib/platform";
+
 async function updateDeckConfigsAndClose(
     input: PlainMessage<UpdateDeckConfigsRequest>,
 ): Promise<void> {
     await postProto(
-        "updateDeckConfigsAndClose",
+        isDesktop() ? "updateDeckConfigsAndClose" : "updateDeckConfigs",
         new UpdateDeckConfigsRequest(input),
         OpChanges,
     );
