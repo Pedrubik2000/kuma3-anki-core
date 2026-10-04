@@ -11,12 +11,14 @@ use fsrs::FSRS5_DEFAULT_DECAY;
 use fsrs::FSRS6_DEFAULT_DECAY;
 use itertools::Either;
 use itertools::Itertools;
+use rayon::prelude::*;
 
 use super::legacy_fsrs_params;
 use super::rescheduler::Rescheduler;
 use crate::card::CardQueue;
 use crate::card::CardType;
 use crate::card::FsrsMemoryState;
+use crate::deckconfig::FsrsVersion;
 use crate::prelude::*;
 use crate::revlog::RevlogEntry;
 use crate::scheduler::answering::fsrs_elapsed_days;
@@ -702,26 +704,43 @@ impl Collection {
             starting_states.push(item.starting_state);
         }
 
-        // fsrs.memory_state_batch is O(nm) where n is the number of cards and m is the
-        // max review count between all items. Therefore we want to pass batches
-        // to fsrs.memory_state_batch where the review count is relatively even.
+        // Keep cards with similar history lengths together, retaining the
+        // established batching and card update order.
         let mut p = permutation::sort_unstable_by_key(&fsrs_items, |item| item.reviews.len());
         p.apply_slice_in_place(&mut to_update);
         p.apply_slice_in_place(&mut fsrs_items);
         p.apply_slice_in_place(&mut starting_states);
 
-        for ((to_update, fsrs_items), starting_states) in to_update
+        // Compute independent batches in parallel, then write cards in the
+        // established sorted order so rescheduling, progress and undo stay
+        // deterministic.
+        let memory_states: Vec<Vec<FsrsMemoryState>> = fsrs_items
             .chunk_into_vecs(FSRS_BATCH_SIZE)
-            .zip_eq(fsrs_items.chunk_into_vecs(FSRS_BATCH_SIZE))
             .zip_eq(starting_states.chunk_into_vecs(FSRS_BATCH_SIZE))
+            .collect_vec()
+            .into_par_iter()
+            .map(|(items, states)| -> Result<Vec<FsrsMemoryState>> {
+                Ok(fsrs
+                    .memory_state_batch(items, states)?
+                    .into_iter()
+                    .map(|state| fsrs_memory_state_for_fsrs(fsrs, state))
+                    .collect())
+            })
+            .collect::<Result<_>>()?;
+        for (to_update, memory_states) in to_update
+            .chunk_into_vecs(FSRS_BATCH_SIZE)
+            .zip_eq(memory_states)
         {
-            let memory_states = fsrs.memory_state_batch(fsrs_items, starting_states)?;
-
+            let mut cards: HashMap<CardId, Card> = self
+                .all_cards_for_ids(&to_update, false)?
+                .into_iter()
+                .map(|card| (card.id, card))
+                .collect();
             for (card_id, memory_state) in to_update.into_iter().zip_eq(memory_states) {
-                let mut card = self.storage.get_card(card_id)?.or_not_found(card_id)?;
+                let mut card = cards.remove(&card_id).or_not_found(card_id)?;
                 let original = card.clone();
                 set_decay_and_desired_retention(&mut card);
-                card.memory_state = Some(fsrs_memory_state_for_fsrs(fsrs, memory_state));
+                card.memory_state = Some(memory_state);
                 maybe_reschedule_card(&mut card, self, fsrs)?;
                 self.update_card_inner(&mut card, original, usn)?;
                 on_updated_card()?;
@@ -1038,7 +1057,12 @@ impl Collection {
         if card_ids.is_empty() {
             return Ok(0);
         }
-        self.transact_no_undo(|col| col.repair_foreign_fsrs_memory_states_inner(card_ids))
+        // Derived state recovery must not advance the collection modification
+        // time or queue cards for upload when opening the collection.
+        self.transact(Op::SkipUndo, |col| {
+            col.repair_foreign_fsrs_memory_states_inner(card_ids)
+        })
+        .map(|out| out.output)
     }
 
     /// Repair a known set of imported/synced cards. Expects a transaction.
@@ -1055,15 +1079,20 @@ impl Collection {
         let mut groups = HashMap::<_, (_, Vec<Card>)>::new();
         for card in cards {
             let preset = presets_by_card.get(&card.id).or_not_found(card.id)?.clone();
+            if preset.fsrs_version != FsrsVersion::Seven {
+                continue;
+            }
             groups
                 .entry((preset.id.clone(), preset.desired_retention.to_bits()))
                 .or_insert_with(|| (preset, Vec::new()))
                 .1
                 .push(card);
         }
+        if groups.is_empty() {
+            return Ok(0);
+        }
 
         let timing = self.timing_today()?;
-        let usn = self.usn()?;
         let mut repaired = 0;
         for (_preset_id, (preset, cards)) in groups {
             let fsrs = FSRS::new(&preset.params)?;
@@ -1083,7 +1112,6 @@ impl Collection {
             let decay = get_decay_from_params(&preset.params);
 
             for mut card in cards {
-                let original = card.clone();
                 let Some(stored) = card.memory_state else {
                     continue;
                 };
@@ -1102,16 +1130,22 @@ impl Collection {
                 };
 
                 card.memory_state = Some(memory_state);
-                card.desired_retention = Some(preset.desired_retention);
+                card.desired_retention
+                    .get_or_insert(preset.desired_retention);
                 card.decay = Some(decay);
                 if items.contains_key(&card.id) {
                     card.last_review_time = self.storage.time_of_last_review(card.id)?;
                 }
-                self.update_card_inner(&mut card, original, usn)?;
+                // AnkiWeb may strip the traces again. Keep this reconstruction
+                // local so two clients do not keep uploading each other's repairs.
+                self.storage.update_card_data(&card)?;
                 repaired += 1;
             }
         }
 
+        if repaired > 0 {
+            self.clear_study_queues();
+        }
         Ok(repaired)
     }
 }
@@ -1827,11 +1861,21 @@ mod tests {
         card.queue = CardQueue::Review;
         card.interval = 30;
         card.due = 123;
+        card.mtime = TimestampSecs(1_700_000_000);
+        card.usn = Usn(12);
+        card.reps = 17;
+        card.lapses = 3;
+        card.custom_data = r#"{"addon":1}"#.into();
         col.storage.update_card(&card)?;
         col.storage.db.execute(
-            r#"update cards set data = '{"s":20.0,"d":6.0}' where id = ?"#,
+            r#"update cards set data = '{"s":20.0,"d":6.0,"dr":0.85,"cd":"{\"addon\":1}"}' where id = ?"#,
             [card.id],
         )?;
+        // Initialize scheduler configuration before measuring repair-only changes.
+        col.timing_today()?;
+        col.storage.set_schema_modified_time(TimestampMillis(1))?;
+        col.storage.set_modified_time(TimestampMillis(2))?;
+        col.storage.set_last_sync(TimestampMillis(2))?;
 
         assert_eq!(
             col.storage.card_ids_with_foreign_fsrs_state()?,
@@ -1846,9 +1890,136 @@ mod tests {
         assert_eq!(state.difficulty, 6.0);
         assert_eq!(repaired.interval, 30);
         assert_eq!(repaired.due, 123);
+        assert_eq!(repaired.mtime, TimestampSecs(1_700_000_000));
+        assert_eq!(repaired.usn, Usn(12));
+        assert_eq!(repaired.reps, 17);
+        assert_eq!(repaired.lapses, 3);
+        assert_eq!(repaired.custom_data, r#"{"addon":1}"#);
+        assert_eq!(repaired.desired_retention, Some(0.85));
+        assert_eq!(
+            col.storage.get_collection_timestamps()?.collection_change,
+            TimestampMillis(2)
+        );
+        assert_eq!(
+            col.sync_status_offline()?,
+            anki_proto::sync::sync_status_response::Required::NoChanges
+        );
         let s90 = fsrs.interval_at_retrievability(state.into(), 0.9);
         assert!((s90 - 20.0).abs() < 0.01, "{s90}");
         assert!(col.storage.card_ids_with_foreign_fsrs_state()?.is_empty());
+        assert_eq!(col.repair_foreign_fsrs_memory_states()?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_fsrs_state_is_repaired_when_internal_stability_was_filled_on_save() -> Result<()> {
+        let mut col = Collection::new();
+        col.set_config_bool(BoolKey::Fsrs, true, false)?;
+        NoteAdder::basic(&mut col).add(&mut col);
+        let mut card = col.get_first_card();
+        card.ctype = CardType::Review;
+        card.queue = CardQueue::Review;
+        // Reading and saving a stripped incoming card fills s_int from s.
+        card.memory_state = Some(FsrsMemoryState {
+            stability: 20.0,
+            stability_internal: 20.0,
+            stability_fast: None,
+            difficulty: 6.0,
+        });
+        col.storage.update_card(&card)?;
+
+        assert_eq!(col.repair_foreign_fsrs_memory_states()?, 1);
+
+        let repaired = col.storage.get_card(card.id)?.unwrap();
+        let state = repaired.memory_state.unwrap();
+        assert!(state.stability_fast.is_some());
+        let fsrs = FSRS::new(&DEFAULT_PARAMETERS)?;
+        assert!((fsrs.interval_at_retrievability(state.into(), 0.9) - 20.0).abs() < 0.01);
+        assert_eq!(col.repair_foreign_fsrs_memory_states()?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_fsrs_state_repair_leaves_older_models_untouched() -> Result<()> {
+        for version in [FsrsVersion::Six, FsrsVersion::Five, FsrsVersion::Four] {
+            let mut col = Collection::new();
+            col.set_config_bool(BoolKey::Fsrs, true, false)?;
+            col.update_default_deck_config(|config| config.fsrs_version = version as i32);
+            NoteAdder::basic(&mut col).add(&mut col);
+            let card = col.get_first_card();
+            col.storage.db.execute(
+                r#"update cards set data = '{"s":20.0,"d":6.0}' where id = ?"#,
+                [card.id],
+            )?;
+            let original = col.storage.get_card(card.id)?.unwrap();
+
+            assert_eq!(col.repair_foreign_fsrs_memory_states()?, 0, "{version:?}");
+
+            assert_eq!(col.storage.get_card(card.id)?.unwrap(), original);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_fsrs_state_repair_uses_the_overlay_model() -> Result<()> {
+        let mut col = Collection::new();
+        col.set_config_bool(BoolKey::Fsrs, true, false)?;
+        col.update_default_deck_config(|config| config.fsrs_version = FsrsVersion::Six as i32);
+        col.set_config(
+            FSRS_PRESET_OVERLAY_CONFIG_KEY,
+            &FsrsPresetOverlay {
+                presets: vec![AddonFsrsPreset {
+                    id: "addon:test:seven".into(),
+                    name: "FSRS7".into(),
+                    fsrs_version: AddonFsrsVersion::Seven,
+                    params: vec![],
+                    desired_retention: 0.9,
+                    historical_retention: 0.9,
+                    ignore_revlogs_before_date: String::new(),
+                    ..Default::default()
+                }],
+                rules: vec![FsrsPresetRule {
+                    search: "".into(),
+                    preset_id: "addon:test:seven".into(),
+                }],
+                ..Default::default()
+            },
+        )?;
+        NoteAdder::basic(&mut col).add(&mut col);
+        let card = col.get_first_card();
+        col.storage.db.execute(
+            r#"update cards set data = '{"s":20.0,"s_int":20.0,"d":6.0}' where id = ?"#,
+            [card.id],
+        )?;
+
+        assert_eq!(col.repair_foreign_fsrs_memory_states()?, 1);
+
+        assert!(col
+            .storage
+            .get_card(card.id)?
+            .unwrap()
+            .memory_state
+            .unwrap()
+            .stability_fast
+            .is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_fsrs_state_repair_leaves_cards_untouched_when_fsrs_is_disabled() -> Result<()> {
+        let mut col = Collection::new();
+        col.set_config_bool(BoolKey::Fsrs, false, false)?;
+        NoteAdder::basic(&mut col).add(&mut col);
+        let card = col.get_first_card();
+        col.storage.db.execute(
+            r#"update cards set data = '{"s":20.0,"d":6.0}' where id = ?"#,
+            [card.id],
+        )?;
+        let original = col.storage.get_card(card.id)?.unwrap();
+
+        assert_eq!(col.repair_foreign_fsrs_memory_states()?, 0);
+
+        assert_eq!(col.storage.get_card(card.id)?.unwrap(), original);
         Ok(())
     }
 
@@ -1882,6 +2053,7 @@ mod tests {
             "actual {actual:?}, expected {expected:?}"
         );
         assert!((actual.stability_internal - expected.stability_internal).abs() < 1e-4);
+        assert!((actual.stability_fast.unwrap() - expected.stability_fast.unwrap()).abs() < 1e-4);
         assert!((actual.difficulty - expected.difficulty).abs() < 1e-4);
         assert_eq!(
             repaired.last_review_time,
@@ -2406,6 +2578,139 @@ mod tests {
 
     mod update_memory_state {
         use super::*;
+
+        #[test]
+        fn parallel_batches_preserve_states_callbacks_and_undo() -> Result<()> {
+            use fsrs::FSRSReview;
+
+            for params in [
+                fsrs::FSRS6_DEFAULT_PARAMETERS.as_slice(),
+                DEFAULT_PARAMETERS.as_slice(),
+            ] {
+                let mut col = Collection::new();
+                let fsrs = FSRS::new(params)?;
+                let mut items = Vec::new();
+                let mut originals = HashMap::new();
+                for i in 0..2005 {
+                    let mut card = Card {
+                        due: i,
+                        ..Default::default()
+                    };
+                    col.storage.add_card(&mut card)?;
+                    originals.insert(card.id, card.clone());
+                    let item = FSRSItem {
+                        reviews: (0..1 + i % 11)
+                            .map(|review| FSRSReview {
+                                rating: 1 + (review % 4) as u32,
+                                delta_t: if review == 0 { 0.0 } else { review as f32 },
+                            })
+                            .collect(),
+                    };
+                    let starting_state = (i % 2 == 0).then_some(MemoryState {
+                        stability: 5.0,
+                        difficulty: 4.0,
+                        stability_fast: 5.0,
+                    });
+                    items.push((
+                        card.id,
+                        FsrsItemForMemoryState {
+                            item,
+                            starting_state,
+                            filtered_revlogs: Vec::new(),
+                        },
+                    ));
+                }
+                // The serial baseline uses the same sorted 1000-card batches.
+                let mut ordered_items = items.clone();
+                let mut order =
+                    permutation::sort_unstable_by_key(&items, |(_, item)| item.item.reviews.len());
+                order.apply_slice_in_place(&mut ordered_items);
+                let mut expected = HashMap::new();
+                for batch in ordered_items.chunks(1000) {
+                    let states = fsrs.memory_state_batch(
+                        batch.iter().map(|(_, item)| item.item.clone()).collect(),
+                        batch.iter().map(|(_, item)| item.starting_state).collect(),
+                    )?;
+                    for ((cid, _), state) in batch.iter().zip(states) {
+                        // Compare the exact persisted state, including the
+                        // existing card-data precision limits.
+                        let mut card = originals[cid].clone();
+                        card.memory_state = Some(fsrs_memory_state_for_fsrs(&fsrs, state));
+                        col.storage.update_card(&card)?;
+                        expected.insert(
+                            *cid,
+                            col.storage.get_card(*cid)?.unwrap().memory_state.unwrap(),
+                        );
+                        col.storage.update_card(&originals[cid])?;
+                    }
+                }
+                let expected_order: Vec<_> = ordered_items.iter().map(|(cid, _)| *cid).collect();
+                let mut callback_order = Vec::new();
+                let mut progress = 0;
+                col.transact(Op::UpdateDeckConfig, |col| {
+                    col.update_memory_state_for_cards_with_items(
+                        items,
+                        &fsrs,
+                        |card| card.desired_retention = Some(0.91),
+                        |card, _, _| {
+                            callback_order.push(card.id);
+                            Ok(())
+                        },
+                        Usn(0),
+                        || {
+                            progress += 1;
+                            Ok(())
+                        },
+                    )
+                })?;
+                assert_eq!(callback_order, expected_order);
+                assert_eq!(progress, expected.len());
+                for (cid, state) in &expected {
+                    let card = col.storage.get_card(*cid)?.unwrap();
+                    assert_eq!(card.memory_state, Some(*state));
+                    assert_eq!(card.due, originals[cid].due);
+                }
+                col.undo()?;
+                for cid in expected.keys() {
+                    let card = col.storage.get_card(*cid)?.unwrap();
+                    assert_eq!(card.memory_state, None);
+                    assert_eq!(card.desired_retention, None);
+                }
+                col.redo()?;
+                for (cid, state) in &expected {
+                    assert_eq!(
+                        col.storage.get_card(*cid)?.unwrap().memory_state,
+                        Some(*state)
+                    );
+                }
+                // An interrupted update must roll back earlier batches too.
+                let mut updates = 0;
+                let result = col.transact(Op::UpdateDeckConfig, |col| {
+                    col.update_memory_state_for_cards_with_items(
+                        ordered_items,
+                        &fsrs,
+                        |card| card.desired_retention = Some(0.5),
+                        |_, _, _| Ok(()),
+                        Usn(0),
+                        || {
+                            updates += 1;
+                            if updates == 1001 {
+                                Err(AnkiError::Interrupted)
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    )
+                });
+                assert!(matches!(result, Err(AnkiError::Interrupted)));
+                for (cid, state) in &expected {
+                    let card = col.storage.get_card(*cid)?.unwrap();
+                    assert_eq!(card.memory_state, Some(*state));
+                    assert_eq!(card.desired_retention, Some(0.91));
+                }
+            }
+            Ok(())
+        }
 
         #[test]
         fn no_req_clears_fsrs_data() -> Result<()> {

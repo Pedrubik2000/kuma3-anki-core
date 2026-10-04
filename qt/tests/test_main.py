@@ -8,6 +8,8 @@ import sys
 from collections.abc import Callable
 from types import SimpleNamespace
 
+import pytest
+
 import aqt.errors
 import aqt.main
 import aqt.rwkv_scheduler
@@ -102,12 +104,17 @@ def test_non_queue_preset_mutation_invalidates_rwkv_before_screen_refresh(
         "fsrs_preset_resolution_did_change",
         lambda _owner: calls.append("rwkv preset"),
     )
+    monkeypatch.setattr(
+        aqt.rwkv_scheduler,
+        "request_rwkv_state_cache_recovery",
+        lambda _owner, **_kwargs: calls.append("rwkv recovery"),
+    )
     changes = OpChanges()
     changes.deck_config = True
 
     mw.on_operation_did_execute(changes, handler=object())
 
-    assert calls == ["rwkv preset", "screen"]
+    assert calls == ["rwkv preset", "rwkv recovery", "screen"]
 
 
 def test_note_content_mutation_preserves_unchanged_rwkv_state_before_refresh(
@@ -135,6 +142,37 @@ def test_note_content_mutation_preserves_unchanged_rwkv_state_before_refresh(
     mw.on_operation_did_execute(changes, handler=initiator)
 
     assert calls == ["rwkv content", "screen"]
+
+
+@pytest.mark.parametrize("changed", ["deck", "deck_config"])
+def test_deck_or_preset_change_requests_rwkv_recovery_after_invalidation(
+    monkeypatch, changed: str
+) -> None:
+    calls: list[str] = []
+    mw = AnkiQt.__new__(AnkiQt)
+    mw.state = "review"
+    mw.reviewer = SimpleNamespace(
+        op_executed=lambda *_args: calls.append("screen") or False
+    )
+    monkeypatch.setattr(aqt.main, "current_window", lambda: mw)
+    monkeypatch.setattr(
+        aqt.rwkv_scheduler,
+        "study_queues_did_change",
+        lambda *_args: calls.append("invalidate"),
+    )
+    monkeypatch.setattr(
+        aqt.rwkv_scheduler,
+        "request_rwkv_state_cache_recovery",
+        lambda _mw, *, reason, allow_during_review: calls.append(
+            "recover during review" if allow_during_review else "recover"
+        ),
+    )
+    changes = OpChanges(study_queues=True)
+    setattr(changes, changed, True)
+
+    mw.on_operation_did_execute(changes, handler=object())
+
+    assert calls == ["invalidate", "recover during review", "screen"]
 
 
 def test_startup_sync_can_defer_rwkv_refresh(
@@ -582,3 +620,71 @@ def test_outdated_fsrs7_preview_warning_text_limits_preset_list() -> None:
     assert f"- Preset {OUTDATED_FSRS7_PREVIEW_WARNING_MAX_PRESETS - 1}" in text
     assert f"- Preset {OUTDATED_FSRS7_PREVIEW_WARNING_MAX_PRESETS}" not in text
     assert "...and 2 more" in text
+
+
+def _rollover_mw(
+    monkeypatch, state: str, cutoff: int
+) -> tuple[AnkiQt, list[str], list[int]]:
+    """A main window at the day-rollover check: `calls` records the
+    reviewer refreshes and the day_did_change calls, `timers` the delay of
+    each next check in ms."""
+    calls: list[str] = []
+    timers: list[int] = []
+    mw = AnkiQt.__new__(AnkiQt)
+    mw.state = state
+    mw.col = SimpleNamespace(sched=SimpleNamespace(day_cutoff=cutoff))  # type: ignore[assignment]
+
+    def refresh_if_needed() -> None:
+        calls.append(f"reviewer refresh {mw.reviewer._refresh_needed.name}")
+
+    mw.reviewer = SimpleNamespace(  # type: ignore[assignment]
+        _refresh_needed=None, refresh_if_needed=refresh_if_needed
+    )
+    mw.progress = SimpleNamespace(  # type: ignore[assignment]
+        timer=lambda ms, func, repeat, parent: timers.append(ms)
+    )
+    monkeypatch.setattr(aqt.main, "int_time", lambda: 1_000)
+    monkeypatch.setattr(
+        aqt.main.gui_hooks, "day_did_change", lambda: calls.append("day_did_change")
+    )
+    mw._last_day_cutoff = cutoff
+    return mw, calls, timers
+
+
+def test_the_day_rollover_fires_day_did_change_in_the_reviewer(monkeypatch) -> None:
+    """The check updated the remembered cutoff while reviewing, and then
+    compared the updated value to decide on the hook, so the hook never
+    fired while the reviewer was open."""
+
+    mw, calls, timers = _rollover_mw(monkeypatch, "review", cutoff=900)
+    mw.col.sched.day_cutoff = 900 + 86_400
+
+    mw._check_day_rollover()
+
+    assert calls == ["reviewer refresh QUEUES", "day_did_change"]
+    # and the next check waits for the next cutoff
+    assert timers == [(900 + 86_400 - 1_000) * 1000]
+
+
+def test_the_day_rollover_fires_day_did_change_once_outside_the_reviewer(
+    monkeypatch,
+) -> None:
+    mw, calls, timers = _rollover_mw(monkeypatch, "deckBrowser", cutoff=900)
+    mw.col.sched.day_cutoff = 900 + 86_400
+
+    mw._check_day_rollover()
+    # a check that comes again on the same day (a timer that fires early)
+    # is no second rollover
+    mw._check_day_rollover()
+
+    assert calls == ["day_did_change"]
+    assert len(timers) == 2
+
+
+def test_no_rollover_changes_nothing(monkeypatch) -> None:
+    mw, calls, timers = _rollover_mw(monkeypatch, "review", cutoff=5_000)
+
+    mw._check_day_rollover()
+
+    assert calls == []
+    assert timers == [4_000_000]

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from aqt.mediasrv import (
     BundledFileRequest,
     LegacyPage,
     LocalFileRequest,
+    MediaServer,
     PageContext,
     UnsafePathException,
     _editor_content_security_policy,
@@ -56,6 +58,37 @@ NEXT_S90_UNAVAILABLE_ROWS = [
         "Again:Unavailable Hard:Unavailable Good:Unavailable Easy:Unavailable",
     ),
 ]
+
+
+def test_media_server_shutdown_closes_listener_and_client_buffers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from waitress import create_server
+    from waitress.buffers import ReadOnlyFileBasedBuffer
+    from waitress.channel import HTTPChannel
+
+    media_server = MediaServer(mock.Mock())
+    media_server.server = create_server(lambda env, start: [], host="127.0.0.1", port=0)
+    server = media_server.server
+    client_socket, peer_socket = socket.socketpair()
+    output = tempfile.TemporaryFile()
+    try:
+        channel = HTTPChannel(
+            server, client_socket, ("127.0.0.1", 0), server.adj, map=server._map
+        )
+        channel.outbufs.append(ReadOnlyFileBasedBuffer(output))
+
+        media_server.shutdown()
+
+        assert not server._map
+        assert not channel.connected
+        assert output.closed
+        assert "unhandled close event" not in caplog.text
+    finally:
+        media_server.shutdown()
+        client_socket.close()
+        peer_socket.close()
+        output.close()
 
 
 def test_rwkv_raw_backend_mutation_scopes() -> None:
@@ -508,6 +541,62 @@ class TestTrustedPageCSP:
         with app.test_request_context("/_anki/legacyPageData?id=1"):
             resp = legacy_page_data()
         assert _get_csp(resp) == _legacy_editor_content_security_policy(12345)
+
+
+class TestBuiltinFileCaching:
+    @pytest.mark.parametrize(
+        ("path", "development", "expected"),
+        [
+            ("js/deckbrowser.js", False, "max-age=31536000"),
+            ("css/deckbrowser.css", False, "max-age=31536000"),
+            ("imgs/anki-logo.svg", False, "max-age=31536000"),
+            ("js/deckbrowser.js", True, None),
+            ("css/deckbrowser.css", True, None),
+            ("imgs/anki-logo.svg", True, None),
+            ("deckbrowser.html", False, None),
+            ("sveltekit/index.html", False, None),
+            ("sveltekit/_app/immutable/start.js", False, "max-age=31536000"),
+            ("sveltekit/_app/immutable/start.js", True, "max-age=31536000"),
+        ],
+    )
+    def test_builtin_assets_cache_only_when_unchanged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        path: str,
+        development: bool,
+        expected: str | None,
+    ) -> None:
+        from aqt import mediasrv
+
+        monkeypatch.setattr(mediasrv, "dev_mode", development)
+        monkeypatch.setattr(mediasrv, "_builtin_data", lambda path: b"asset")
+
+        with mediasrv.app.test_request_context():
+            response = _handle_builtin_file_request(BundledFileRequest(path))
+
+        assert response.get_data() == b"asset"
+        assert response.headers.get("Cache-Control") == expected
+        if path.endswith(".html"):
+            assert _get_csp(response) == TRUSTED_PAGE_CSP
+
+    @pytest.mark.parametrize("untrusted", [True, False])
+    def test_local_media_and_addon_assets_keep_revalidation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, untrusted: bool
+    ) -> None:
+        from aqt import mediasrv
+
+        monkeypatch.setattr(mediasrv, "dev_mode", False)
+        (tmp_path / "addon.js").write_bytes(b"asset")
+
+        with mediasrv.app.test_request_context():
+            response = _handle_local_file_request(
+                LocalFileRequest(str(tmp_path), "addon.js", untrusted=untrusted)
+            )
+
+        response.direct_passthrough = False
+        assert response.get_data() == b"asset"
+        assert response.cache_control.max_age == 0
+        assert _get_csp(response) == (UNTRUSTED_MEDIA_CSP if untrusted else None)
 
 
 class TestCardStats:

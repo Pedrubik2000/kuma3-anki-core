@@ -408,12 +408,27 @@ RWKV ordering path or the normal due fallback until a later prediction puts them
 back below target. When
 `rwkv_review_allow_same_day_review` is disabled, scored review cards that were
 already answered during the current scheduler day are also withheld until the
-next day. When same-day RWKV re-review is enabled,
+next day. With FSRS enabled, turning off **Allow same day review for
+(re)learning steps** also withholds these cards, even when **Skip
+learning/relearning queues with FSRS/RWKV** is enabled. This restriction applies
+to queue selection, deck counts, daily minimums, and `is:rwkv:due` searches.
+When both same-day settings permit RWKV re-review,
 `rwkv_review_min_intervening_reviews` can require a number of other answered
 reviews in the selected deck tree before the same card is admitted again, and
 `rwkv_review_min_elapsed_secs` can require that many seconds since the card's
 stored last review time. If both values are nonzero, both guards must be
 satisfied.
+
+Answering Again on a card already answered during the current scheduler day
+does not increase its lapse count or trigger leech tagging or suspension.
+This applies regardless of queue skipping or scheduler, including rescheduling
+filtered decks and **Grade Now**. A review card's first answer of a scheduler day
+still adds a lapse when answered Again; subsequent answers that day do not, even
+if the first answer was successful. Learning and relearning answers continue to
+preserve the existing lapse count.
+Each answer is still recorded and updates the scheduling model. The day boundary
+uses Anki's configured rollover time, including when the last answer time must
+be recovered from the revlog.
 
 RWKV-selected cards also honor the general **Same-day reviews ignore review
 limit** daily-limits option. When enabled, an eligible scored card already
@@ -533,7 +548,12 @@ and intervening review history. Parent counts are evaluated independently of
 their children's displayed counts: a parent requiring six intervening reviews
 can show zero while a child requiring two shows one. The uncapped review total
 used by daily-limit labels follows the same scope, so different repeat
-eligibility is not presented as a daily-limit restriction. The currently
+eligibility is not presented as a daily-limit restriction. The reviewer's bottom
+bar shows the same uncapped total in grey beside the green review count when
+the total is larger, for example `157 (/959)`. It includes the selected deck's
+subdecks and updates after answers and RWKV queue refreshes. While the review
+count is pending, the total label is hidden until fresh counts are available.
+The currently
 selected scope is processed first. While a scope is pending, its review due count and the
 review due counts of its descendants display an ellipsis instead of the stored
 FSRS count. A completed scope reveals its RWKV count; a skipped or failed scope
@@ -600,6 +620,13 @@ RWKV backend, and prepare fresh scores before the final search. Cards without a
 fresh applicable prediction do not match either predicate. Candidate discovery
 temporarily broadens the RWKV-dependent predicates so future cards that the
 model considers due are not omitted before scoring.
+
+Filtered-deck preparation waits on its collection worker for concurrent RWKV
+predictions to release the resident backend, then holds that access through
+scoring and score publication. Blocking filtered-deck preparations share work
+with one another, separately from nonblocking Stats preparations that may
+return pending. If the captured RWKV state changes while waiting or a prediction
+fails, the operation still aborts before creating or rebuilding the filtered deck.
 
 Card Info refreshes its score through the RWKV review-candidate prediction path
 each time it renders instead of reusing a score installed by Card Info, review
@@ -879,6 +906,24 @@ the UI thread, but Anki blocks review/deck interaction until the cache build
 finishes so the saved state is current when the operation completes. During
 replay, the progress dialog shows how many historical reviews have been applied
 to the cache, elapsed time, and estimated time remaining.
+
+RWKV switches apply to each card's own deck preset, including the original deck
+of a filtered card. Enabling RWKV on a parent does not override a different
+subdeck preset. Saving deck or preset changes invalidates dependent predictions
+and schedules the same state recovery used by the overview, even during review.
+Recovery restores a compatible saved state or replays history when the preset
+routing or replay settings changed. The reviewer refreshes its queue after
+recovery without requiring an application restart. Concurrent recovery requests
+are coalesced, and a scheduled request is discarded if its collection has closed
+or changed.
+
+Open Card Info windows refresh after deck/preset setting changes and after a
+successful state load or build. Their retrievability-source label uses the
+current preset enablement even if an earlier diagnostic prediction remains
+available. The desktop `rwkv_state_did_prepare(mw)` GUI hook reports successful
+state preparation on the main thread; Card Info subscribes only while its window
+is open. An enabled card can still show RWKV as unavailable while recovery is in
+progress or after recovery fails.
 Before publication, Anki explicitly closes both the state-store writer and its
 cache-validation database readers. On Windows, publishing the rebuilt cache also
 retries transient file-sharing failures caused by another process briefly holding

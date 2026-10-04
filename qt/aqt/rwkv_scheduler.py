@@ -28,7 +28,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from concurrent.futures import Future
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1064,6 +1064,7 @@ RwkvStatsPrepareKey = tuple[
     int,
     int,
     str,
+    bool,
     bool,
     bool,
     bool,
@@ -2927,6 +2928,10 @@ def apply_reviewer_redo_card_ids(reviewer: object, card_ids: Sequence[int]) -> N
         return
 
     _invalidate_reviewer_transient_scores_after_redo(reviewer, valid_card_ids)
+    if getattr(getattr(reviewer, "card", None), "id", None) in valid_card_ids:
+        # Redo answered the visible card again, so allow the queue refresh
+        # to move on instead of preserving it as an undo-restored card.
+        setattr(reviewer, "_rwkv_undo_restored_card_active", False)
     queue = getattr(reviewer, _RWKV_REVIEW_UNDO_CARD_IDS_ATTR, None)
     if isinstance(queue, list):
         for card_id in valid_card_ids:
@@ -6127,7 +6132,7 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
     prepare_curve_due: bool = False,
     prepare_curve_retrievability: bool = False,
 ) -> RwkvStatsPreparationStatus:
-    """Prepare transient RWKV scores for cards matched by a stats graph search."""
+    """Prepare transient RWKV scores, waiting for backend access for filtered decks."""
 
     prepare_instant_due = prepare_instant_due or _search_uses_rwkv_instant_due(search)
     prepare_curve_due = prepare_curve_due or _search_uses_rwkv_curve_due(search)
@@ -6155,6 +6160,7 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
     state_token: _ReviewerBackendPredictionStateToken | None = None
     owns_prepare = False
     prepare_status = RwkvStatsPreparationStatus.FAILED
+    prediction_access = ExitStack()
     try:
         logger.debug("RWKV stats preparation started: search=%r", search)
         warmup_start = time.monotonic()
@@ -6221,6 +6227,7 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
             prepare_instant_due=prepare_instant_due,
             prepare_curve_due=prepare_curve_due,
             prepare_curve_retrievability=prepare_curve_retrievability,
+            wait_for_backend=warm_up_if_needed,
         )
         prepare_generation = state_token.state_generation
         if prepare_key is not None:
@@ -6244,6 +6251,21 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
                     if _reviewer_backend_prediction_state_token_is_current(state_token)
                     else RwkvStatsPreparationStatus.FAILED
                 )
+        if warm_up_if_needed:
+            # Claim access after coalescing: an existing owner may need this
+            # lock to finish. Keep it through scoring and publication so a
+            # competing reader cannot turn a filtered rebuild into PENDING.
+            logger.debug(
+                "RWKV filtered-deck scoring waiting for backend: search=%r", search
+            )
+            backend = prediction_access.enter_context(
+                _try_reviewer_backend_prediction_access(
+                    expected_state_token=state_token,
+                    wait_for_access=True,
+                )
+            )
+            if backend is None:
+                _raise_reviewer_backend_prediction_unavailable(state_token)
         search_score_start = time.monotonic()
         search_score_result = _rwkv_stats_graph_scores_for_search(
             reviewer=reviewer,
@@ -6380,12 +6402,15 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
             )
         return RwkvStatsPreparationStatus.FAILED
     finally:
-        if owns_prepare and prepare_key is not None and prepare_future is not None:
-            _finish_rwkv_stats_prepare(
-                prepare_key,
-                prepare_future,
-                prepare_status,
-            )
+        try:
+            prediction_access.close()
+        finally:
+            if owns_prepare and prepare_key is not None and prepare_future is not None:
+                _finish_rwkv_stats_prepare(
+                    prepare_key,
+                    prepare_future,
+                    prepare_status,
+                )
 
 
 def prepare_filtered_deck_retrievability_scores(
@@ -6656,6 +6681,7 @@ def _rwkv_stats_prepare_key(
     prepare_instant_due: bool = False,
     prepare_curve_due: bool = False,
     prepare_curve_retrievability: bool = False,
+    wait_for_backend: bool = False,
 ) -> RwkvStatsPrepareKey | None:
     warmup_key = _reviewer_backend_warmup_key(reviewer)
     timing = _timing_today(reviewer)
@@ -6714,6 +6740,7 @@ def _rwkv_stats_prepare_key(
         prepare_instant_due,
         prepare_curve_due,
         prepare_curve_retrievability,
+        wait_for_backend,
     )
 
 
@@ -7696,6 +7723,10 @@ def current_reviewer_diagnostics(
     if prediction is None:
         return None
 
+    prediction = replace(
+        prediction,
+        review_enabled=rwkv_review_active(reviewer, card),
+    )
     return RwkvReviewerDiagnostics(
         retrievability=prediction.retrievability,
         retrievability_source=_retrievability_source(prediction, fallback_source),
@@ -11367,10 +11398,12 @@ def request_rwkv_state_cache_recovery(
     mw: object,
     *,
     reason: str,
+    allow_during_review: bool = False,
 ) -> bool:
     """Schedule one visible canonical recovery when resident RWKV state is cold."""
 
     reviewer = SimpleNamespace(mw=mw)
+    collection = _collection(reviewer)
     if not _rwkv_collection_config_state(reviewer).review_enabled:
         return False
     if not configure_reviewer_backend_from_environment():
@@ -11397,11 +11430,29 @@ def request_rwkv_state_cache_recovery(
     _set_rwkv_state_cache_recovery_scheduled(mw, True)
     logger.info("RWKV state recovery scheduled: reason=%s", reason)
 
+    def refresh_review(ready: bool) -> None:
+        if (
+            ready
+            and getattr(mw, "state", None) == "review"
+            and _collection(reviewer) is collection
+        ):
+            getattr(mw, "reviewer").op_executed(
+                collection_pb2.OpChanges(study_queues=True),
+                None,
+                focused=True,
+            )
+
     def start_recovery() -> None:
         _set_rwkv_state_cache_recovery_scheduled(mw, False)
-        if getattr(mw, "state", None) not in ("deckBrowser", "overview"):
+        allowed_states: tuple[str, ...] = ("deckBrowser", "overview")
+        if allow_during_review:
+            allowed_states += ("review",)
+        if (
+            _collection(reviewer) is not collection
+            or getattr(mw, "state", None) not in allowed_states
+        ):
             logger.debug(
-                "RWKV state recovery cancelled outside count view: reason=%s state=%s",
+                "RWKV state recovery cancelled outside its collection or view: reason=%s state=%s",
                 reason,
                 getattr(mw, "state", None),
             )
@@ -11411,6 +11462,11 @@ def request_rwkv_state_cache_recovery(
             return
         if _rwkv_resident_state_ready(mw):
             _refresh_active_rwkv_count_view(mw)
+            from aqt import gui_hooks
+
+            gui_hooks.rwkv_state_did_prepare(cast(Any, mw))
+            if allow_during_review:
+                refresh_review(True)
             return
 
         logger.info("RWKV state recovery starting: reason=%s", reason)
@@ -11418,6 +11474,7 @@ def request_rwkv_state_cache_recovery(
             build_rwkv_state_cache_with_progress(
                 mw,
                 recovery_reason=reason,
+                on_done=refresh_review if allow_during_review else None,
             )
         except Exception:
             _set_rwkv_state_cache_recovery_failed(mw, True)
@@ -11453,6 +11510,10 @@ def _notify_rwkv_state_cache_completion(mw: object, ready: bool) -> bool:
             callback(ready)
         except Exception:
             logger.exception("RWKV state cache completion callback failed")
+    if ready:
+        from aqt import gui_hooks
+
+        gui_hooks.rwkv_state_did_prepare(cast(Any, mw))
     return bool(callbacks)
 
 
