@@ -1028,11 +1028,57 @@ impl Collection {
         Ok(())
     }
 
+    /// Recompute, from the review history, the FSRS state of cards that came
+    /// back from a sync without their fast component. The result is local: the
+    /// cards' mtime and usn are kept, so the repair is never uploaded and two
+    /// clients cannot keep sending each other their repairs.
+    pub fn repair_stripped_fsrs_memory_states(&mut self) -> Result<usize> {
+        if !self.get_config_bool(BoolKey::Fsrs) {
+            return Ok(0);
+        }
+        let card_ids = self.storage.card_ids_with_stripped_fsrs_state()?;
+        if card_ids.is_empty() {
+            return Ok(0);
+        }
+        self.transact_no_undo(|col| col.repair_stripped_fsrs_memory_states_inner(card_ids))
+    }
+
+    /// Expects a transaction.
+    pub(crate) fn repair_stripped_fsrs_memory_states_inner(
+        &mut self,
+        card_ids: Vec<CardId>,
+    ) -> Result<usize> {
+        if card_ids.is_empty() || !self.get_config_bool(BoolKey::Fsrs) {
+            return Ok(0);
+        }
+        let mut repaired = 0;
+        for card_id in card_ids {
+            let Some(mut card) = self.storage.get_card(card_id)? else {
+                continue;
+            };
+            let computed = self.compute_memory_state_for_card(&card, false)?;
+            let Some(state) = computed.memory_state else {
+                continue;
+            };
+            if state.stability_fast.is_none() {
+                continue;
+            }
+            card.memory_state = Some(state);
+            self.storage.update_card(&card)?;
+            repaired += 1;
+        }
+        Ok(repaired)
+    }
+
     /// Restore complete FSRS state on cards written by clients that preserve
     /// only the public S90 and difficulty fields.
     pub(crate) fn repair_foreign_fsrs_memory_states(&mut self) -> Result<usize> {
         if !self.get_config_bool(BoolKey::Fsrs) {
             return Ok(0);
+        }
+        // collection open, after a full sync, Check Database
+        if let Err(err) = self.repair_stripped_fsrs_memory_states() {
+            tracing::warn!(?err, "repairing stripped FSRS memory states failed");
         }
         let card_ids = self.storage.card_ids_with_foreign_fsrs_state()?;
         if card_ids.is_empty() {
