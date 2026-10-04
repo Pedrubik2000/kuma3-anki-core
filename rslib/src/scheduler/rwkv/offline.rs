@@ -210,7 +210,7 @@ impl Collection {
     }
 
     /// Scores every Instant-enabled deck now and installs the deck count
-    /// scores. The work is not split into steps: `complete` is always true.
+    /// scores, in one call.
     ///
     /// `restart` is the desktop's "Rebuild RWKV State": the model state is
     /// thrown away and the whole review history is replayed. `status_only`
@@ -246,14 +246,10 @@ impl Collection {
         let scored = result? as u32;
         Ok(RwkvOfflineInstantPassProgress {
             available: true,
-            complete: true,
             scored,
-            total: scored,
-            step_cards: scored,
             step_micros: started.elapsed().as_micros() as u64,
             reviews_absorbed,
             reviews_replayed,
-            ..Default::default()
         })
     }
 

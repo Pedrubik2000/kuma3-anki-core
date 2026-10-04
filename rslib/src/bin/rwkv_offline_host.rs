@@ -72,9 +72,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         RwkvOfflineInstantPassStepRequest::default(),
     )?;
     println!(
-        "instant pass: available={} complete={} scored={} in {} ms",
+        "instant pass: available={} scored={} in {} ms",
         pass.available,
-        pass.complete,
         pass.scored,
         start.elapsed().as_millis()
     );
