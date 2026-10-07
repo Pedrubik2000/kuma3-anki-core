@@ -277,7 +277,16 @@ fn persist_tempfile(
     if overwrite {
         file.persist(target)?;
     } else {
-        file.persist_noclobber(target)?;
+        match file.persist_noclobber(target) {
+            Ok(_) => {}
+            // Android shared storage (/storage/emulated/0, FUSE) refuses both
+            // RENAME_NOREPLACE and hard links with EACCES: plain rename when
+            // the target is still free.
+            Err(err) if !target.exists() => {
+                err.file.persist(target)?;
+            }
+            Err(err) => return Err(err.into()),
+        }
     }
     #[cfg(not(windows))]
     if fsync {
