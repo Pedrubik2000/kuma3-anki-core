@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use crate::collection::RwkvCountCards;
 use crate::deckconfig::DeckConfig;
 use crate::deckconfig::DeckConfigId;
 use crate::decks::limits::LimitTreeMap;
@@ -160,6 +161,7 @@ impl Collection {
         };
 
         let mut pull_candidates = Vec::new();
+        let mut waiting = Vec::new();
         for (card_id, score) in scores {
             let Some(metadata) = metadata.get(card_id) else {
                 continue;
@@ -185,6 +187,13 @@ impl Collection {
                 score.target_retention,
             );
             let rwkv_due = matches!(eligibility, RwkvReviewScoreEligibility::Eligible);
+            if !rwkv_due
+                && score
+                    .target_retention
+                    .is_some_and(|target| score.retrievability < target)
+            {
+                waiting.push(*card_id);
+            }
             let Some(counts) = counts.get_mut(&metadata.current_deck_id) else {
                 continue;
             };
@@ -261,15 +270,20 @@ impl Collection {
         pull_candidates.sort_unstable_by(|(card_a, score_a, _), (card_b, score_b, _)| {
             score_a.total_cmp(score_b).then_with(|| card_a.cmp(card_b))
         });
-        for (_, _, deck_id) in pull_candidates {
+        let mut minimum = Vec::new();
+        for (card_id, _, deck_id) in pull_candidates {
             if !minimums.rwkv_review_minimum_remaining(deck_id)? {
                 continue;
             }
             if let Some(counts) = counts.get_mut(&deck_id) {
                 counts.review = counts.review.saturating_add(1);
                 minimums.reserve_rwkv_reviews(deck_id, 1)?;
+                minimum.push(card_id);
             }
         }
+        self.state
+            .rwkv_count_cards
+            .insert(score_deck_id, RwkvCountCards { minimum, waiting });
 
         Ok(counts)
     }

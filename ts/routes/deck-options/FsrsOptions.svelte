@@ -17,6 +17,7 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
         setWantsAbort,
     } from "@generated/backend";
     import * as tr from "@generated/ftl";
+    import { isDesktop } from "@tslib/platform";
     import { runWithBackendProgress } from "@tslib/progress";
 
     import SettingTitle from "$lib/components/SettingTitle.svelte";
@@ -35,6 +36,7 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     import ParamsInputRow from "./ParamsInputRow.svelte";
     import ParamsSearchRow from "./ParamsSearchRow.svelte";
     import DynamicDesiredRetentionPlotModal from "./DynamicDesiredRetentionPlotModal.svelte";
+    import RwkvForecast from "./RwkvForecast.svelte";
     import SimulatorModal from "./SimulatorModal.svelte";
     import {
         deltaClass,
@@ -109,6 +111,8 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     }
 
     const config = state.currentConfig;
+    // kuma3: the RWKV forecast's preset; $config changes when another preset is picked
+    $: rwkvForecastPreset = $config && state.getCurrentNameForSearch();
     const defaults = state.defaults;
     const fsrsReschedule = state.fsrsReschedule;
     const fsrsShortTermWithStepsEnabled = state.fsrsShortTermWithStepsEnabled;
@@ -1533,6 +1537,10 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 {/if}
 
 <Warning warning={newCardIntervalsError} className={"alert-warning"} />
+
+{#if !isDesktop() && $config.rwkvReviewInstantOrderEnabled}
+    <RwkvForecast presetSearch={rwkvForecastPreset} selected={effectiveDesiredRetention} />
+{/if}
 <Warning warning={outdatedFsrs7ParamsWarning} className="alert-warning" />
 
 <div class="ms-1 me-1">

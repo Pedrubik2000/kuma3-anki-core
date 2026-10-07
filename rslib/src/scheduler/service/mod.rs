@@ -1130,6 +1130,13 @@ impl crate::services::SchedulerService for Collection {
     ) -> Result<anki_proto::scheduler::RwkvOfflineInstantPassProgress> {
         Collection::rwkv_offline_instant_pass_step(self, input)
     }
+
+    fn rwkv_offline_forecast(
+        &mut self,
+        input: anki_proto::scheduler::RwkvOfflineForecastRequest,
+    ) -> Result<anki_proto::scheduler::RwkvOfflineForecastResponse> {
+        Collection::rwkv_offline_forecast(self, input)
+    }
 }
 
 fn selected_short_term_with_steps_for_preview(requested: Option<bool>, stored: bool) -> bool {

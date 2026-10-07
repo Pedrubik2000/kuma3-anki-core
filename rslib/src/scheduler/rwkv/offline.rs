@@ -28,9 +28,12 @@ use std::time::Instant;
 
 use anki_proto::deck_config::deck_config::config::NewCardGatherPriority;
 use anki_proto::scheduler::rwkv_historical_review_inputs_response::Review;
+use anki_proto::scheduler::rwkv_offline_forecast_response::Card as ForecastCard;
 use anki_proto::scheduler::rwkv_review_input_rows_for_cards_response::Row;
 use anki_proto::scheduler::RwkvHistoricalReviewIdentity;
 use anki_proto::scheduler::RwkvHistoricalReviewInputsRequest;
+use anki_proto::scheduler::RwkvOfflineForecastRequest;
+use anki_proto::scheduler::RwkvOfflineForecastResponse;
 use anki_proto::scheduler::RwkvOfflineInstantPassProgress;
 use anki_proto::scheduler::RwkvOfflineInstantPassStepRequest;
 use anki_proto::scheduler::RwkvPrepareOfflineRequest;
@@ -41,6 +44,7 @@ use rusqlite::OptionalExtension;
 use super::offline_state;
 use super::*;
 use crate::collection::RwkvReviewQueueScoreEntry;
+use crate::decks::limits::LimitTreeMap;
 use crate::rwkv::ReviewInput;
 use crate::rwkv::RwkvInference;
 use crate::scheduler::states::CardState;
@@ -59,6 +63,9 @@ const DECK_COUNT_SCORE_MAX_AGE_SECS: i64 = 120;
 /// many reviews were absorbed since it was written (a start replays at most
 /// these few).
 const SAVE_STATE_AFTER_REVIEWS: u64 = 200;
+/// The forecast's default cards: review cards that RWKV-Instant schedules
+/// (learning cards follow their steps), as the desktop add-on.
+const FORECAST_SEARCH: &str = "is:review -is:learn -is:suspended -is:buried";
 
 /// The model path of the last successful `RwkvPrepareOffline`. The runtime
 /// lives in the collection state, which is lost when the collection is
@@ -215,6 +222,16 @@ fn answered_input(review: &Review) -> ReviewInput {
     }
 }
 
+/// `query` asked `secs` later, `days` day rollovers later.
+fn forecast_input(mut query: ReviewInput, secs: i64, days: i64) -> ReviewInput {
+    if secs != 0 {
+        query.current_elapsed_seconds = query.current_elapsed_seconds.map(|s| s + secs);
+        query.current_elapsed_days = query.current_elapsed_days.map(|d| d + days);
+        query.day_offset = query.day_offset.map(|d| d + days);
+    }
+    query
+}
+
 fn valid_probability(value: f32) -> Option<f32> {
     (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(value)
 }
@@ -319,6 +336,174 @@ impl Collection {
             reviews_absorbed,
             reviews_replayed,
         })
+    }
+
+    /// Recall of review cards at later times. The model state is not
+    /// touched: each card's query input is moved forward in time (seconds
+    /// since its last review, and past the rollover its elapsed days and the
+    /// day number), as the desktop add-on and the fork's Memorised graph do.
+    /// So every number means "if you stop reviewing now".
+    pub(crate) fn rwkv_offline_forecast(
+        &mut self,
+        input: RwkvOfflineForecastRequest,
+    ) -> Result<RwkvOfflineForecastResponse> {
+        let mut out = RwkvOfflineForecastResponse::default();
+        if !self.rwkv_offline_enabled() {
+            return Ok(out);
+        }
+        let ok = self.with_rwkv_offline_runtime("forecast", |col, runtime| {
+            col.rwkv_offline_forecast_inner(runtime, &input, &mut out)
+        });
+        require!(ok, "RWKV forecast failed");
+        out.available = self.state.rwkv_offline.is_some();
+        // Outside the runtime closure: the deck counts score with the runtime.
+        self.rwkv_offline_forecast_minimums(&input, &mut out)?;
+        Ok(out)
+    }
+
+    /// "Minimum reviews per day": which cards today's deck counts add for it,
+    /// and the deck list's total at the next rollover, when the minimums
+    /// start again from zero reviews.
+    ///
+    /// Each deck row is counted in its own scope (the deck and its children),
+    /// so a parent's minimum can pull cards its children's rows don't show.
+    /// A card counts as its own deck's row counts it, so the forecast adds up
+    /// to the rows you study from. Today's cards are recorded by the deck
+    /// count itself.
+    fn rwkv_offline_forecast_minimums(
+        &mut self,
+        input: &RwkvOfflineForecastRequest,
+        out: &mut RwkvOfflineForecastResponse,
+    ) -> Result<()> {
+        let mut decks = Vec::new();
+        for scope in self.rwkv_offline_instant_scopes()? {
+            decks.extend(self.storage.child_decks(&scope)?);
+            decks.push(scope);
+        }
+        self.state.rwkv_count_cards.clear();
+        let _ = self.deck_tree(Some(TimestampSecs::now()))?;
+        let counted = std::mem::take(&mut self.state.rwkv_count_cards);
+        for card in &mut out.cards {
+            if let Some(own) = counted.get(&DeckId(card.deck_id)) {
+                card.minimum_today = own.minimum.contains(&CardId(card.card_id));
+                card.waiting = own.waiting.contains(&CardId(card.card_id));
+            }
+        }
+
+        let Some(at) = input.offsets_secs.iter().position(|&secs| secs < 0) else {
+            return Ok(());
+        };
+        let configs = self.storage.get_deck_config_map()?;
+        let tomorrow = self.timing_today()?.days_elapsed + 1;
+        let mut total = out
+            .cards
+            .iter()
+            .filter(|card| card.recall[at] < card.target_retention)
+            .count() as u32;
+        for deck in decks {
+            let own = deck.id;
+            let mut tree = self.storage.child_decks(&deck)?;
+            tree.insert(0, deck);
+            // built for tomorrow, nothing is reviewed yet: full minimums
+            let mut minimums = LimitTreeMap::build(&tree, &configs, tomorrow, false);
+            let ids: HashSet<_> = tree.iter().map(|deck| deck.id.0).collect();
+            let mut not_due = Vec::new();
+            for card in out.cards.iter().filter(|card| ids.contains(&card.deck_id)) {
+                if card.recall[at] < card.target_retention {
+                    minimums.reserve_rwkv_reviews_if_present(DeckId(card.deck_id), 1);
+                } else {
+                    not_due.push((card.recall[at], card.card_id, DeckId(card.deck_id)));
+                }
+            }
+            // the lowest recall first, as the deck count and the queue pull them
+            not_due.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            for (_, _, deck_id) in not_due {
+                if minimums
+                    .rwkv_review_minimum_remaining(deck_id)
+                    .unwrap_or(false)
+                {
+                    minimums.reserve_rwkv_reviews(deck_id, 1)?;
+                    total += u32::from(deck_id == own);
+                }
+            }
+        }
+        out.rollover_with_minimum = Some(total);
+        Ok(())
+    }
+
+    fn rwkv_offline_forecast_inner(
+        &mut self,
+        runtime: &mut RwkvOfflineRuntime,
+        input: &RwkvOfflineForecastRequest,
+        out: &mut RwkvOfflineForecastResponse,
+    ) -> Result<()> {
+        self.rwkv_offline_sync_history(runtime)?;
+        let search = if input.search.is_empty() {
+            FORECAST_SEARCH.to_string()
+        } else {
+            input.search.clone()
+        };
+        let rows = self
+            .rwkv_review_input_rows_for_search(RwkvReviewInputRowsForSearchRequest {
+                search,
+                ..Default::default()
+            })?
+            .rows;
+        let now = TimestampSecs::now().0;
+        let cutoff = self.timing_today()?.next_day_at.0;
+        out.offsets_secs = input
+            .offsets_secs
+            .iter()
+            .map(|&secs| {
+                if secs < 0 {
+                    (cutoff - now).max(1)
+                } else {
+                    secs
+                }
+            })
+            .collect();
+        let base: Vec<_> = rows.iter().map(query_input).collect();
+        let mut recall = vec![Vec::with_capacity(out.offsets_secs.len()); rows.len()];
+        for &secs in &out.offsets_secs {
+            let at = now + secs;
+            // day rollovers crossed (1 s of slack, as the desktop add-on)
+            let days = if at < cutoff - 1 {
+                0
+            } else {
+                1 + (at - cutoff).max(0) / 86_400
+            };
+            let shifted = base
+                .iter()
+                .cloned()
+                .map(|query| forecast_input(query, secs, days))
+                .collect();
+            let scores = runtime
+                .inference
+                .predict_retrievability_many_from_warm_up(shifted)?;
+            for (card, score) in recall.iter_mut().zip(scores) {
+                card.push(score);
+            }
+        }
+        // cards the model could not score are left out (deck counts skip them too)
+        out.cards = rows
+            .iter()
+            .zip(recall)
+            .filter_map(|(row, recall)| {
+                if recall.iter().any(|r| valid_probability(*r).is_none()) {
+                    return None;
+                }
+                Some(ForecastCard {
+                    card_id: row.card_id,
+                    deck_id: row.deck_id,
+                    target_retention: valid_probability(row.target_retention)?,
+                    recall,
+                    // set by rwkv_offline_forecast_minimums
+                    minimum_today: false,
+                    waiting: false,
+                })
+            })
+            .collect();
+        Ok(())
     }
 
     /// Called before a review queue is built.
@@ -686,14 +871,8 @@ impl Collection {
         Ok(ids)
     }
 
-    /// Install deck count scores for every top-most Instant-enabled deck and
-    /// its children, like the desktop's deck browser. Returns the number of
-    /// cards scored.
-    fn rwkv_offline_install_deck_count_scores_inner(
-        &mut self,
-        runtime: &mut RwkvOfflineRuntime,
-        max_age_secs: i64,
-    ) -> Result<usize> {
+    /// The top-most Instant-enabled decks: each is scored with its children.
+    fn rwkv_offline_instant_scopes(&mut self) -> Result<Vec<Deck>> {
         let configs = self.storage.get_deck_config_map()?;
         let mut decks = self.storage.get_all_decks()?;
         decks.sort_by(|a, b| a.name.as_native_str().cmp(b.name.as_native_str()));
@@ -713,7 +892,18 @@ impl Collection {
                 scopes.push(deck);
             }
         }
+        Ok(scopes)
+    }
 
+    /// Install deck count scores for every top-most Instant-enabled deck and
+    /// its children, like the desktop's deck browser. Returns the number of
+    /// cards scored.
+    fn rwkv_offline_install_deck_count_scores_inner(
+        &mut self,
+        runtime: &mut RwkvOfflineRuntime,
+        max_age_secs: i64,
+    ) -> Result<usize> {
+        let scopes = self.rwkv_offline_instant_scopes()?;
         self.clear_rwkv_deck_count_scores();
         let mut scored = 0;
         for scope in scopes {

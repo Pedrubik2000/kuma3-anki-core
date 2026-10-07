@@ -160,6 +160,10 @@ service SchedulerService {
   // Rescores every Instant-enabled deck and installs the deck count scores.
   rpc RwkvOfflineInstantPassStep(RwkvOfflineInstantPassStepRequest)
       returns (RwkvOfflineInstantPassProgress);
+  // Projected recall of review cards at later times, "if you stop reviewing
+  // now" (kuma3's version of the desktop rwkv_forecast add-on).
+  rpc RwkvOfflineForecast(RwkvOfflineForecastRequest)
+      returns (RwkvOfflineForecastResponse);
 }
 
 // Implicitly includes any of the above methods that are not listed in the
@@ -980,6 +984,41 @@ message RwkvOfflineInstantPassProgress {
   uint64 reviews_absorbed = 4;
   // Reviews this call replayed (all of them after a restart).
   uint64 reviews_replayed = 5;
+}
+
+message RwkvOfflineForecastRequest {
+  // Cards to forecast; empty = every review card
+  // ("is:review -is:learn -is:suspended -is:buried").
+  string search = 1;
+  // Seconds from now; a negative value means the next day rollover.
+  repeated int64 offsets_secs = 2;
+}
+
+message RwkvOfflineForecastResponse {
+  message Card {
+    int64 card_id = 1;
+    // The card's home deck.
+    int64 deck_id = 2;
+    // The recall the card is due under.
+    float target_retention = 3;
+    // One per requested offset.
+    repeated float recall = 4;
+    // Not due, but in today's reviews to reach "minimum reviews per day"
+    // (the cards the deck list adds for it).
+    bool minimum_today = 5;
+    // Below its target, but the deck list does not count it yet: it waits for
+    // the repeat spacing ("minimum intervening reviews", same-day rules).
+    bool waiting = 6;
+  }
+  // False until RwkvPrepareOffline has succeeded on this collection.
+  bool available = 1;
+  repeated Card cards = 2;
+  // The offsets used (the rollover resolved to seconds).
+  repeated int64 offsets_secs = 3;
+  // At the next rollover (when a negative offset was asked for): the due
+  // cards plus what "minimum reviews per day" adds then, as the deck list
+  // would count them if you stop reviewing now.
+  optional uint32 rollover_with_minimum = 4;
 }
 
 message RwkvReviewQueueScoresRequest {

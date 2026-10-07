@@ -142,6 +142,9 @@ pub struct CollectionState {
     pub(crate) rwkv_retrievability_scores: Option<RwkvRetrievabilityScores>,
     /// Model state for RWKV-Instant on clients without the desktop's Python.
     pub(crate) rwkv_offline: Option<Box<crate::scheduler::rwkv::RwkvOfflineRuntime>>,
+    /// What the last deck count did with each RWKV scope's cards, by scope
+    /// deck (read by the RWKV forecast).
+    pub(crate) rwkv_count_cards: HashMap<DeckId, RwkvCountCards>,
     pub(crate) fsrs_preset_overlay_cache: Option<FsrsPresetOverlayCache>,
     pub(crate) active_browser_columns: Option<Arc<Vec<browser_table::Column>>>,
     /// True if legacy Python code has executed SQL that has modified the
@@ -151,6 +154,16 @@ pub struct CollectionState {
     /// can publish success without locking or retaining the collection itself.
     pub(crate) last_backup_modified: Arc<Mutex<Option<TimestampMillis>>>,
     pub(crate) progress: Arc<Mutex<ProgressState>>,
+}
+
+/// See [CollectionState::rwkv_count_cards].
+#[derive(Debug, Default)]
+pub(crate) struct RwkvCountCards {
+    /// Added to reach "minimum reviews per day".
+    pub(crate) minimum: Vec<CardId>,
+    /// Below their target but not counted yet: waiting for the repeat spacing
+    /// ("minimum intervening reviews", same-day rules).
+    pub(crate) waiting: Vec<CardId>,
 }
 
 pub struct Collection {

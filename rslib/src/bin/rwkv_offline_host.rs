@@ -16,6 +16,7 @@ use anki::collection::CollectionBuilder;
 use anki::services::DecksService;
 use anki::services::SchedulerService;
 use anki_proto::decks::DeckTreeRequest;
+use anki_proto::scheduler::RwkvOfflineForecastRequest;
 use anki_proto::scheduler::RwkvOfflineInstantPassStepRequest;
 use anki_proto::scheduler::RwkvPrepareOfflineRequest;
 
@@ -153,9 +154,81 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  {}: new={} learn={} review={}",
             deck.name, deck.new_count, deck.learn_count, deck.review_count
         );
+        for child in &deck.children {
+            println!(
+                "    {}: new={} learn={} review={}",
+                child.name, child.new_count, child.learn_count, child.review_count
+            );
+        }
     }
 
+    // Forecast: "now" must equal the installed scores; later times only move
+    // the clock, so recall can only change by time passing.
+    let start = Instant::now();
+    let forecast = SchedulerService::rwkv_offline_forecast(
+        &mut col,
+        RwkvOfflineForecastRequest {
+            search: String::new(),
+            offsets_secs: vec![0, 3600, 3 * 3600, -1],
+        },
+    )?;
+    let ms = start.elapsed().as_millis();
+    let installed: std::collections::HashMap<_, _> = all_scores(&mut col)?.into_iter().collect();
+    let due = |i: usize| {
+        forecast
+            .cards
+            .iter()
+            .filter(|c| c.recall[i] < c.target_retention)
+            .count()
+    };
+    let max_diff = forecast
+        .cards
+        .iter()
+        .filter_map(|c| installed.get(&c.card_id).map(|r| (r - c.recall[0]).abs()))
+        .fold(0f32, f32::max);
+    println!(
+        "forecast: available={} {} cards in {ms} ms, offsets {:?}; due now {} / 1 h {} / 3 h {} / tomorrow {}; max |now - installed| {max_diff:.6}",
+        forecast.available,
+        forecast.cards.len(),
+        forecast.offsets_secs,
+        due(0),
+        due(1),
+        due(2),
+        due(3),
+    );
+    // due now - waiting + minimum cards must equal the deck list's review counts
+    let minimum = forecast.cards.iter().filter(|c| c.minimum_today).count();
+    let waiting = forecast.cards.iter().filter(|c| c.waiting).count();
+    // a top deck whose preset is not RWKV-Instant shows 0: count its children then
+    let deck_list: u32 = tree
+        .children
+        .iter()
+        .map(|d| {
+            d.review_count
+                .max(d.children.iter().map(|c| c.review_count).sum())
+        })
+        .sum();
+    println!(
+        "minimum: {minimum} cards today, {waiting} waiting; due - waiting + minimum = {} vs deck list {deck_list}; tomorrow with minimum {:?}",
+        due(0) - waiting + minimum,
+        forecast.rollover_with_minimum,
+    );
+
     if let Some(path) = args.get(3) {
+        let mut out = BufWriter::new(File::create(format!("{path}.forecast.csv"))?);
+        writeln!(out, "card_id,deck_id,target,now,1h,3h,tomorrow,minimum")?;
+        for c in &forecast.cards {
+            let r: Vec<_> = c.recall.iter().map(|r| format!("{r:.6}")).collect();
+            writeln!(
+                out,
+                "{},{},{},{},{}",
+                c.card_id,
+                c.deck_id,
+                c.target_retention,
+                r.join(","),
+                c.minimum_today as u8
+            )?;
+        }
         let mut out = BufWriter::new(File::create(path)?);
         writeln!(out, "card_id,retrievability")?;
         let scores = all_scores(&mut col)?;
