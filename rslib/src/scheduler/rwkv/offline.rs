@@ -680,10 +680,15 @@ impl Collection {
             return Ok(0);
         }
 
-        let dynamic_preset_replay = self.storage.all_deck_config()?.iter().any(|config| {
-            (config.inner.rwkv_review_enabled || config.inner.rwkv_review_instant_order_enabled)
-                && config.inner.rwkv_review_dynamic_preset_replay
-        });
+        // The synced collection setting wins over the legacy per-preset flags,
+        // as `_rwkv_collection_config_state` in rwkv_scheduler.py.
+        let dynamic_preset_replay = match self.get_config_optional("rwkvDynamicPresetReplay") {
+            Some(setting) => setting,
+            None => self.storage.all_deck_config()?.iter().any(|config| {
+                (config.inner.rwkv_review_enabled || config.inner.rwkv_review_instant_order_enabled)
+                    && config.inner.rwkv_review_dynamic_preset_replay
+            }),
+        };
         let mut history = RwkvHistoricalReviewFingerprintRequest {
             dynamic_preset_replay,
             ..Default::default()

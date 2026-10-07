@@ -131,7 +131,6 @@ _DEFAULT_RWKV_REVIEW_BATCH_SIZE = 512
 _RWKV_REVIEW_RESCHEDULE_BATCH_SIZE = 128
 _DEFAULT_RWKV_REVIEW_REFRESH_INTERVAL = 1
 _DEFAULT_RWKV_REVIEW_MIN_INTERVENING_REVIEWS = 5
-_DEFAULT_RWKV_REVIEW_FIRST_REVIEW_ELAPSED_FROM_CARD_CREATION = True
 _MIN_RWKV_REVIEW_BATCH_SIZE = 64
 _MAX_RWKV_REVIEW_BATCH_SIZE = 8192
 _AUTO_RWKV_RETRIEVABILITY_BATCH_SIZE = 2048
@@ -178,6 +177,19 @@ _RWKV_RETRIEVABILITY_SAMPLE_ROLE_TEST_FOLD = "test_fold"
 _RWKV_RETRIEVABILITY_SAMPLE_ROLE_POST_OPTIMIZATION = "post_optimization"
 _RWKV_CALIBRATION_METRIC_EPSILON = 1e-6
 _RWKV_CALIBRATION_TRAIN_FRACTION = 0.70
+_RWKV_CALIBRATION_RECOMPUTE_SOURCE = "rwkv_calibration_recompute"
+# State-cache lineage a complete set of calibration predictions was made on.
+_RWKV_CALIBRATION_EPOCH_FILE = "calibration-epoch-v1.json"
+_RWKV_CALIBRATION_EPOCH_KEYS = (
+    "collection",
+    "model",
+    "replayKey",
+    "presetReplaySemantics",
+    "dynamicPresetReplay",
+    "storeGeneration",
+    "snapshotSegmentId",
+    "snapshotHistoryHash",
+)
 _EMBEDDED_RWKV_MODEL_FILENAME = "RWKV_trained_on_5000_10000.bin"
 _RWKV_MODEL_KEY_HASH_CHUNK_SIZE = 1024 * 1024
 _RWKV_STATE_CACHE_VERSION = 12
@@ -242,6 +254,9 @@ _reviewer_backend_warmup_states: dict[
     RwkvResidentStateIdentity | None,
 ] = {}
 _reviewer_backend_warmup_generations: dict[tuple[int, int], int] = {}
+_reviewer_backend_revalidation_candidates: dict[
+    tuple[int, int], tuple[int, RwkvResidentStateIdentity]
+] = {}
 _reviewer_backend_warmup_pending_generations: dict[tuple[int, int], int] = {}
 _reviewer_backend_cold_fallback_generations: dict[tuple[int, int], int] = {}
 _rwkv_memorised_history_identity_cache: dict[
@@ -722,6 +737,7 @@ class RwkvCollectionMutationReconciliation:
 @dataclass(frozen=True)
 class _RwkvReconciledCollectionChange:
     collection_mod: int | None
+    card_ids: tuple[int, ...] = ()
     removed_card_ids: tuple[int, ...] = ()
 
 
@@ -2373,6 +2389,50 @@ class RwkvStatefulReviewerBackend:
             frame,
         )
 
+    def answered_review_retrievability(
+        self,
+        *,
+        reviewer: object,
+        card: object,
+        ease: int,
+    ) -> float | None:
+        """Pre-answer retrievability, queried as historical replay records it.
+
+        Call before `review_answered()` applies the same answer.
+        """
+
+        identity = rwkv_review_identity(reviewer, card)
+        if identity is None:
+            return None
+        review_input = rwkv_review_input(
+            reviewer=reviewer,
+            card=card,
+            identity=identity,
+            ease=ease,
+        )
+        if review_input.ease is None:
+            return None
+        state = self._review_state_snapshot(identity, review_input)
+        transition = self._runtime.review(
+            review_input=replace(
+                review_input,
+                is_query=True,
+                ease=None,
+                duration_millis=None,
+            ),
+            card_state=state.card_state,
+            note_state=state.note_state,
+            deck_state=state.deck_state,
+            preset_state=state.preset_state,
+            global_state=state.global_state,
+        )
+        retrievability = getattr(
+            getattr(transition, "prediction", None),
+            "retrievability",
+            None,
+        )
+        return float(retrievability) if _valid_probability(retrievability) else None
+
     def review_input_answered(self, review_input: RwkvReviewInput) -> None:
         if review_input.ease is None:
             return
@@ -2774,6 +2834,7 @@ def _record_collection_undo_or_redo_with_backend(
         handler_name = "answer_redone" if redo else "answer_undone"
         handler = getattr(backend, handler_name, None)
         if callable(handler):
+            _drop_reviewer_backend_revalidation_candidates(backend)
             restored = handler(counter, next_counter)
             if card_id := _valid_card_id(restored):
                 restored_card_ids = [card_id]
@@ -3047,49 +3108,46 @@ def _reconciled_collection_change_owner(reviewer: object) -> object:
 def _mark_collection_change_reconciled(
     reviewer: object,
     *,
+    card_ids: tuple[int, ...] = (),
     removed_card_ids: tuple[int, ...] = (),
 ) -> None:
-    pending = _RwkvReconciledCollectionChange(
+    owner = _reconciled_collection_change_owner(reviewer)
+    change = _RwkvReconciledCollectionChange(
         _rwkv_collection_modified(reviewer),
+        card_ids=card_ids,
         removed_card_ids=removed_card_ids,
     )
-    owner = _reconciled_collection_change_owner(reviewer)
-    setattr(owner, _RWKV_RECONCILED_COLLECTION_CHANGE_PENDING_ATTR, pending)
-    if owner is not reviewer:
-        setattr(reviewer, _RWKV_RECONCILED_COLLECTION_CHANGE_PENDING_ATTR, pending)
-
-
-def _consume_reconciled_collection_change(reviewer: object) -> bool:
-    return _take_reconciled_collection_change(reviewer) is not None
+    with _reviewer_backend_state_lock:
+        pending = getattr(owner, _RWKV_RECONCILED_COLLECTION_CHANGE_PENDING_ATTR, ())
+        pending = (*pending, change)[-64:]
+        for target in (owner, reviewer, getattr(owner, "reviewer", None)):
+            if target is not None:
+                setattr(
+                    target, _RWKV_RECONCILED_COLLECTION_CHANGE_PENDING_ATTR, pending
+                )
 
 
 def _take_reconciled_collection_change(
     reviewer: object,
 ) -> _RwkvReconciledCollectionChange | None:
     owner = _reconciled_collection_change_owner(reviewer)
-    pending = getattr(
-        owner,
-        _RWKV_RECONCILED_COLLECTION_CHANGE_PENDING_ATTR,
-        None,
-    )
-    active_reviewer = getattr(owner, "reviewer", None)
-    for target in (owner, reviewer, active_reviewer):
-        if target is not None:
-            setattr(
-                target,
-                _RWKV_RECONCILED_COLLECTION_CHANGE_PENDING_ATTR,
-                False,
-            )
-    if not isinstance(pending, _RwkvReconciledCollectionChange):
+    if not getattr(owner, _RWKV_RECONCILED_COLLECTION_CHANGE_PENDING_ATTR, ()):
         return None
+    # Read the collection outside the lock shared with prediction access.
     current_mod = _rwkv_collection_modified(reviewer)
-    if (
-        pending.collection_mod is None
-        or current_mod is None
-        or current_mod == pending.collection_mod
-    ):
-        return pending
-    return None
+    with _reviewer_backend_state_lock:
+        pending = getattr(owner, _RWKV_RECONCILED_COLLECTION_CHANGE_PENDING_ATTR, ())
+        if not pending:
+            return None
+        newest_mod = pending[-1].collection_mod
+        valid = newest_mod is None or current_mod is None or current_mod == newest_mod
+        remaining = pending[1:] if valid else ()
+        for target in (owner, reviewer, getattr(owner, "reviewer", None)):
+            if target is not None:
+                setattr(
+                    target, _RWKV_RECONCILED_COLLECTION_CHANGE_PENDING_ATTR, remaining
+                )
+        return pending[0] if valid else None
 
 
 def _current_undo_counter(reviewer: object) -> int | None:
@@ -3395,6 +3453,7 @@ def _invalidate_all_reviewer_backend_runtime_state_locked() -> None:
         | _reviewer_backend_warmup_generations.keys()
         | _reviewer_backend_warmup_pending_generations.keys()
         | _reviewer_backend_cold_fallback_generations.keys()
+        | _reviewer_backend_revalidation_candidates.keys()
         | _rwkv_memorised_history_identity_cache.keys()
     )
     for key in keys:
@@ -3402,6 +3461,7 @@ def _invalidate_all_reviewer_backend_runtime_state_locked() -> None:
             _reviewer_backend_warmup_generations.get(key, 0) + 1
         )
     _reviewer_backend_warmup_states.clear()
+    _reviewer_backend_revalidation_candidates.clear()
     _reviewer_backend_warmup_pending_generations.clear()
     _reviewer_backend_cold_fallback_generations.clear()
     _rwkv_memorised_history_identity_cache.clear()
@@ -3745,6 +3805,8 @@ def _finish_reviewer_backend_temporary_operation(
 ) -> None:
     discard_queue_scores = False
     with _reviewer_backend_state_lock:
+        if not restored:
+            _drop_reviewer_backend_revalidation_candidates(operation.backend)
         col = _collection(operation.reviewer)
         current = (
             _reviewer_backend is operation.backend
@@ -4235,6 +4297,7 @@ def record_collection_mutation_reconciliation(
         _save_collection_mutation_rollback_entry(reconciliation)
         _mark_collection_change_reconciled(
             reviewer,
+            card_ids=reconciliation.card_ids,
             removed_card_ids=_removed_card_ids(reviewer, reconciliation.card_ids),
         )
         logger.debug(
@@ -4319,10 +4382,7 @@ def _require_collection_mutation_reconciliation_current(
             "mutation changed canonical review membership"
         )
 
-    _invalidate_resolved_preset_id_cache(
-        reviewer,
-        card_ids=reconciliation.card_ids,
-    )
+    _refresh_resolved_fsrs_preset_ids(reviewer, reconciliation.card_ids)
     current_identities = _rwkv_identities_for_card_ids(
         reviewer,
         current_historical_card_ids,
@@ -4648,6 +4708,7 @@ def record_grade_now_answers(
                 "review_inputs_answered",
                 None,
             )
+            _drop_reviewer_backend_revalidation_candidates(mutation_context.backend)
             if callable(review_inputs_answered):
                 review_inputs_answered(reviewer, review_inputs)
             else:
@@ -5078,6 +5139,13 @@ def record_reviewer_answer(
                 )
                 logger.debug("RWKV answer update deferred: %s", recovery_reason)
                 return
+            _drop_reviewer_backend_revalidation_candidates(backend)
+            calibration_prediction = _rwkv_answer_calibration_prediction(
+                reviewer,
+                backend,
+                card,
+                ease,
+            )
             backend.review_answered(
                 reviewer=reviewer,
                 card=card,
@@ -5089,6 +5157,12 @@ def record_reviewer_answer(
             ):
                 logger.debug("RWKV answer bookkeeping skipped: backend context changed")
                 return
+            if calibration_prediction is not None:
+                _record_rwkv_answer_calibration_prediction(
+                    reviewer,
+                    card,
+                    calibration_prediction,
+                )
             _mark_reviewer_backend_identity_unknown(
                 reviewer,
                 reason="review answered",
@@ -6161,6 +6235,32 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
     owns_prepare = False
     prepare_status = RwkvStatsPreparationStatus.FAILED
     prediction_access = ExitStack()
+    phase = "warmup"
+
+    def stopped(
+        reason: str,
+        status: RwkvStatsPreparationStatus = RwkvStatsPreparationStatus.FAILED,
+    ) -> RwkvStatsPreparationStatus:
+        if warm_up_if_needed and status in {
+            RwkvStatsPreparationStatus.PENDING,
+            RwkvStatsPreparationStatus.FAILED,
+        }:
+            logger.warning(
+                "RWKV filtered-deck scoring stopped: reason=%s phase=%s status=%s "
+                "search=%r backend=%s warmup_pending=%s expected_generation=%s "
+                "current_generation=%s elapsed_ms=%.1f",
+                reason,
+                phase,
+                status.value,
+                search,
+                type(_reviewer_backend).__name__,
+                _reviewer_backend_warmup_pending(reviewer),
+                state_token.state_generation if state_token is not None else None,
+                _reviewer_backend_state_generation(),
+                (time.monotonic() - start) * 1000,
+            )
+        return status
+
     try:
         logger.debug("RWKV stats preparation started: search=%r", search)
         warmup_start = time.monotonic()
@@ -6184,6 +6284,7 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
             and (wait_for_warmup or needs_scores)
             and _reviewer_backend_warmup_pending(reviewer)
         ):
+            phase = "warmup_wait"
             warmed_up = _wait_for_reviewer_backend_warmup(
                 reviewer,
                 timeout_secs=(
@@ -6206,12 +6307,14 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
                 search,
             )
             if warm_up_if_needed and _reviewer_backend is not None:
-                return RwkvStatsPreparationStatus.FAILED
-            return (
+                return stopped("warmup_not_ready")
+            return stopped(
+                "warmup_not_ready",
                 RwkvStatsPreparationStatus.PENDING
                 if _reviewer_backend_warmup_pending(reviewer)
-                else RwkvStatsPreparationStatus.UNAVAILABLE
+                else RwkvStatsPreparationStatus.UNAVAILABLE,
             )
+        phase = "state_capture"
         state_token = _capture_reviewer_backend_prediction_state_token(reviewer)
         if state_token is None:
             logger.debug(
@@ -6219,7 +6322,7 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
                 "backend state unavailable search=%r",
                 search,
             )
-            return RwkvStatsPreparationStatus.FAILED
+            return stopped("state_unavailable")
         prepare_key = _rwkv_stats_prepare_key(
             reviewer,
             search,
@@ -6233,6 +6336,7 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
         if prepare_key is not None:
             prepare_future, owns_prepare = _begin_rwkv_stats_prepare(prepare_key)
             if not owns_prepare:
+                phase = "shared_preparation"
                 wait_start = time.monotonic()
                 logger.debug(
                     "RWKV stats preparation waiting for in-flight result: search=%r",
@@ -6249,9 +6353,10 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
                 return (
                     prepare_status
                     if _reviewer_backend_prediction_state_token_is_current(state_token)
-                    else RwkvStatsPreparationStatus.FAILED
+                    else stopped("state_changed")
                 )
         if warm_up_if_needed:
+            phase = "backend_access"
             # Claim access after coalescing: an existing owner may need this
             # lock to finish. Keep it through scoring and publication so a
             # competing reader cannot turn a filtered rebuild into PENDING.
@@ -6266,6 +6371,7 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
             )
             if backend is None:
                 _raise_reviewer_backend_prediction_unavailable(state_token)
+        phase = "search_scoring"
         search_score_start = time.monotonic()
         search_score_result = _rwkv_stats_graph_scores_for_search(
             reviewer=reviewer,
@@ -6279,6 +6385,7 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
         if search_score_result is not None:
             scores = search_score_result.scores
             input_build = search_score_result.input_build
+            phase = "publication"
             set_start = time.monotonic()
             if not _set_rwkv_stats_graph_scores_if_current(
                 reviewer,
@@ -6302,12 +6409,12 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
                         "deferred RWKV stats scores while backend was busy: search=%r",
                         search,
                     )
-                    return prepare_status
+                    return stopped("backend_busy", prepare_status)
                 logger.debug(
                     "discarded RWKV stats scores after state change: search=%r",
                     search,
                 )
-                return RwkvStatsPreparationStatus.FAILED
+                return stopped("state_changed")
             set_elapsed_ms = (time.monotonic() - set_start) * 1000
             logger.debug(
                 "prepared RWKV stats retrievability scores from backend search: "
@@ -6328,7 +6435,8 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
                 "discarded RWKV stats search fallback after state change: search=%r",
                 search,
             )
-            return RwkvStatsPreparationStatus.FAILED
+            return stopped("state_changed")
+        phase = "candidate_search"
         card_ids_start = time.monotonic()
         card_ids = _stats_graph_card_ids(reviewer, search)
         card_ids_elapsed_ms = (time.monotonic() - card_ids_start) * 1000
@@ -6338,6 +6446,7 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
             len(card_ids),
             card_ids_elapsed_ms,
         )
+        phase = "fallback_scoring"
         score_start = time.monotonic()
         scores = _rwkv_stats_graph_scores(
             reviewer=reviewer,
@@ -6346,6 +6455,7 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
             state_token=state_token,
         )
         score_elapsed_ms = (time.monotonic() - score_start) * 1000
+        phase = "publication"
         set_start = time.monotonic()
         if not _set_rwkv_stats_graph_scores_if_current(
             reviewer,
@@ -6359,12 +6469,12 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
                     "deferred RWKV stats scores while backend was busy: search=%r",
                     search,
                 )
-                return prepare_status
+                return stopped("backend_busy", prepare_status)
             logger.debug(
                 "discarded RWKV stats scores after state change: search=%r",
                 search,
             )
-            return RwkvStatsPreparationStatus.FAILED
+            return stopped("state_changed")
         set_elapsed_ms = (time.monotonic() - set_start) * 1000
         logger.debug(
             "prepared RWKV stats retrievability scores: search=%r candidates=%s scored=%s "
@@ -6384,12 +6494,16 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
     except _ReviewerBackendPredictionBusy:
         prepare_status = RwkvStatsPreparationStatus.PENDING
         logger.debug("RWKV stats retrievability scoring deferred: backend busy")
-        return prepare_status
+        return stopped("backend_busy", prepare_status)
     except _ReviewerBackendPredictionAborted:
         logger.debug("RWKV stats retrievability scoring aborted: backend stale")
-        return RwkvStatsPreparationStatus.FAILED
+        return stopped("state_changed")
     except Exception:
-        logger.exception("RWKV stats retrievability scoring failed")
+        logger.exception(
+            "RWKV stats retrievability scoring failed: phase=%s search=%r",
+            phase,
+            search,
+        )
         if state_token is None:
             if _rwkv_stats_prepare_generation_is_current(prepare_generation):
                 _set_rwkv_stats_graph_scores(reviewer, search, [])
@@ -6400,7 +6514,7 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
                 [],
                 state_token=state_token,
             )
-        return RwkvStatsPreparationStatus.FAILED
+        return stopped("exception")
     finally:
         try:
             prediction_access.close()
@@ -6451,8 +6565,11 @@ def prepare_filtered_deck_retrievability_scores(
             joiner="OR",
         )
     except Exception:
-        logger.debug(
-            "failed to build RWKV filtered-deck candidate search", exc_info=True
+        logger.warning(
+            "RWKV filtered-deck scoring stopped: reason=candidate_search_failed "
+            "phase=candidate_search status=failed searches=%r",
+            [term.search for term in terms],
+            exc_info=True,
         )
         return RwkvStatsPreparationStatus.FAILED
 
@@ -8147,6 +8264,15 @@ def _rwkv_collection_config_state(
         if _rwkv_review_dynamic_preset_replay(config):
             dynamic_preset_replay_enabled = True
 
+    get_config = getattr(col, "get_config", None)
+    if callable(get_config):
+        try:
+            setting = get_config("rwkvDynamicPresetReplay")
+            if isinstance(setting, bool):
+                dynamic_preset_replay_enabled = setting
+        except Exception:
+            logger.debug("failed to read global RWKV dynamic preset replay setting")
+
     return _RwkvCollectionConfigState(
         review_enabled=review_enabled,
         dynamic_preset_replay_enabled=dynamic_preset_replay_enabled,
@@ -9254,7 +9380,9 @@ def _preset_ids_for_card_ids(
     }
 
 
-def _resolved_fsrs_preset_id(reviewer: object, card_id: int) -> str | None:
+def _resolved_fsrs_preset_id(
+    reviewer: object, card_id: int, *, refresh: bool = False
+) -> str | None:
     resolved_preset_id = getattr(reviewer, "_rwkv_resolved_preset_id", None)
     if isinstance(resolved_preset_id, str) and resolved_preset_id:
         return resolved_preset_id
@@ -9263,7 +9391,7 @@ def _resolved_fsrs_preset_id(reviewer: object, card_id: int) -> str | None:
         _preset_id_cache_key(reviewer),
         {},
     )
-    if card_id in cache:
+    if not refresh and card_id in cache:
         return cache[card_id]
 
     mw = getattr(reviewer, "mw", None)
@@ -9289,12 +9417,33 @@ def _resolved_fsrs_preset_ids(
     reviewer: object,
     card_ids: Sequence[int],
 ) -> dict[int, str]:
+    return _resolve_fsrs_preset_ids(reviewer, card_ids, refresh=False)
+
+
+def _refresh_resolved_fsrs_preset_ids(
+    reviewer: object,
+    card_ids: Sequence[int],
+) -> dict[int, str]:
+    return _resolve_fsrs_preset_ids(reviewer, card_ids, refresh=True)
+
+
+def _resolve_fsrs_preset_ids(
+    reviewer: object,
+    card_ids: Sequence[int],
+    *,
+    refresh: bool = False,
+) -> dict[int, str]:
     if not card_ids:
         return {}
 
     collection_key = _preset_id_cache_key(reviewer)
     cache = _resolved_preset_id_cache.setdefault(collection_key, {})
-    resolved = {card_id: cache[card_id] for card_id in card_ids if card_id in cache}
+    # Keep validated entries visible while the backend resolves fresh assignments.
+    resolved = (
+        {}
+        if refresh
+        else {card_id: cache[card_id] for card_id in card_ids if card_id in cache}
+    )
     missing_card_ids = [card_id for card_id in card_ids if card_id not in resolved]
     if not missing_card_ids:
         logger.debug(
@@ -9319,6 +9468,10 @@ def _resolved_fsrs_preset_ids(
             batch_resolved = _fsrs_preset_ids_response_items(response)
             cache.update(batch_resolved)
             resolved.update(batch_resolved)
+            if refresh:
+                for card_id in card_ids:
+                    if card_id not in resolved:
+                        cache.pop(card_id, None)
             logger.debug(
                 "RWKV FSRS preset resolve finished: cards=%s cached=%s "
                 "missing=%s resolved=%s elapsed_ms=%.1f",
@@ -9333,10 +9486,14 @@ def _resolved_fsrs_preset_ids(
             logger.debug("failed to batch-resolve FSRS presets for RWKV review input")
 
     for card_id in missing_card_ids:
-        preset_id = _resolved_fsrs_preset_id(reviewer, card_id)
+        preset_id = _resolved_fsrs_preset_id(reviewer, card_id, refresh=refresh)
         if preset_id is not None:
             cache[card_id] = preset_id
             resolved[card_id] = preset_id
+    if refresh:
+        for card_id in card_ids:
+            if card_id not in resolved:
+                cache.pop(card_id, None)
     logger.debug(
         "RWKV FSRS preset per-card resolve finished: cards=%s cached=%s missing=%s "
         "resolved=%s elapsed_ms=%.1f",
@@ -9471,6 +9628,7 @@ def _invalidate_reviewer_backend_state(
     *,
     reason: str,
     preserve_cold_fallback: bool = False,
+    keep_revalidation_candidate: bool = False,
     expected_mutation_context: _ReviewerBackendMutationContext | None = None,
 ) -> None:
     invalidated = False
@@ -9501,16 +9659,28 @@ def _invalidate_reviewer_backend_state(
                 _reviewer_backend_cold_fallback_generations.get(key)
                 == previous_generation
             )
-            _reviewer_backend_warmup_states.pop(key, None)
+            identity = _reviewer_backend_warmup_states.pop(key, None)
             _rwkv_memorised_history_identity_cache.pop(key, None)
             generation = previous_generation + 1
             _reviewer_backend_warmup_generations[key] = generation
+            candidate = _reviewer_backend_revalidation_candidates.get(key)
+            if keep_revalidation_candidate and identity is not None:
+                _reviewer_backend_revalidation_candidates[key] = (generation, identity)
+            elif keep_revalidation_candidate and not was_warm and candidate is not None:
+                _reviewer_backend_revalidation_candidates[key] = (
+                    generation,
+                    candidate[1],
+                )
+            else:
+                _reviewer_backend_revalidation_candidates.pop(key, None)
             if preserve_cold_fallback and cold_fallback:
                 _reviewer_backend_cold_fallback_generations[key] = generation
             else:
                 _reviewer_backend_cold_fallback_generations.pop(key, None)
             _rwkv_collection_mutation_undo_entries.clear()
             _rwkv_collection_mutation_redo_entries.clear()
+        elif key is not None:
+            _reviewer_backend_revalidation_candidates.pop(key, None)
     try:
         _clear_rwkv_review_queue_scores(reviewer)
     except Exception:
@@ -9541,6 +9711,7 @@ def _publish_reviewer_backend_state(
         backend_changed = current_backend_id != key[0]
         if current_generation == expected_generation and not backend_changed:
             _reviewer_backend_warmup_states[key] = identity
+            _reviewer_backend_revalidation_candidates.pop(key, None)
             _reviewer_backend_cold_fallback_generations.pop(key, None)
             _rwkv_memorised_history_identity_cache[key] = (
                 current_generation,
@@ -9582,6 +9753,7 @@ def _mark_reviewer_backend_identity_unknown(
         )
         if key in _reviewer_backend_warmup_states:
             _reviewer_backend_warmup_states[key] = None
+        _reviewer_backend_revalidation_candidates.pop(key, None)
         _rwkv_memorised_history_identity_cache.pop(key, None)
         generation = previous_generation + 1
         _reviewer_backend_warmup_generations[key] = generation
@@ -9611,12 +9783,14 @@ def _invalidate_reviewer_backend_states(
                 | _reviewer_backend_warmup_generations.keys()
                 | _reviewer_backend_warmup_pending_generations.keys()
                 | _reviewer_backend_cold_fallback_generations.keys()
+                | _reviewer_backend_revalidation_candidates.keys()
                 | _rwkv_memorised_history_identity_cache.keys()
             )
             if key[0] == backend_id
         ]
         for key in matching_keys:
             _reviewer_backend_warmup_states.pop(key, None)
+            _reviewer_backend_revalidation_candidates.pop(key, None)
             _reviewer_backend_cold_fallback_generations.pop(key, None)
             _rwkv_memorised_history_identity_cache.pop(key, None)
             _reviewer_backend_warmup_generations[key] = (
@@ -9646,6 +9820,7 @@ def _mark_reviewer_backend_identities_unknown(
                 | _reviewer_backend_warmup_generations.keys()
                 | _reviewer_backend_warmup_pending_generations.keys()
                 | _reviewer_backend_cold_fallback_generations.keys()
+                | _reviewer_backend_revalidation_candidates.keys()
                 | _rwkv_memorised_history_identity_cache.keys()
             )
             if key[0] == backend_id
@@ -9653,6 +9828,7 @@ def _mark_reviewer_backend_identities_unknown(
         for key in matching_keys:
             if key in _reviewer_backend_warmup_states:
                 _reviewer_backend_warmup_states[key] = None
+            _reviewer_backend_revalidation_candidates.pop(key, None)
             _reviewer_backend_cold_fallback_generations.pop(key, None)
             _rwkv_memorised_history_identity_cache.pop(key, None)
             _reviewer_backend_warmup_generations[key] = (
@@ -9676,6 +9852,7 @@ def _begin_forced_reviewer_backend_warmup_with_execution_locked(
         if _reviewer_backend is not backend:
             return _ReviewerBackendWarmupStart(None, False)
         _reviewer_backend_warmup_states.pop(key, None)
+        _reviewer_backend_revalidation_candidates.pop(key, None)
         _reviewer_backend_cold_fallback_generations.pop(key, None)
         _rwkv_memorised_history_identity_cache.pop(key, None)
         generation = _reviewer_backend_warmup_generations.get(key, 0) + 1
@@ -9774,7 +9951,85 @@ def _begin_reviewer_backend_warmup(
             _reviewer_backend_execution_lock.release()
 
 
-def _warm_up_reviewer_backend(
+def _drop_reviewer_backend_revalidation_candidates(backend: object) -> None:
+    with _reviewer_backend_state_lock:
+        for key in list(_reviewer_backend_revalidation_candidates):
+            if key[0] == id(backend):
+                _reviewer_backend_revalidation_candidates.pop(key, None)
+
+
+def _revalidate_resident_reviewer_backend_state(
+    reviewer: object,
+    key: tuple[int, int],
+    warmup_generation: int,
+) -> RwkvResidentStateIdentity | None:
+    with _reviewer_backend_state_lock:
+        candidate = _reviewer_backend_revalidation_candidates.get(key)
+    if candidate is None:
+        return None
+
+    try:
+        generation, identity = candidate
+        if generation != warmup_generation:
+            raise ValueError("candidate generation changed")
+        if _rwkv_preserved_learning_start_cutoffs(reviewer):
+            raise ValueError("preserved learning start cutoffs")
+        metadata = _read_rwkv_state_cache_metadata(reviewer)
+        if not metadata or not _rwkv_state_cache_metadata_compatible(
+            reviewer,
+            metadata,
+            dynamic_preset_replay_enabled=None,
+        ):
+            raise ValueError("cache metadata incompatible or missing")
+        if (
+            metadata.get("lastReviewId") != identity.last_review_id
+            or metadata.get("reviewCount") != identity.review_count
+            or metadata.get("historyHash") != identity.history_hash
+            or metadata.get("replayKey") != identity.replay_key
+        ):
+            raise ValueError("cache metadata identity changed")
+        if (
+            _rwkv_replay_semantics_key(
+                reviewer,
+                first_review_elapsed_source=RwkvFirstReviewElapsedSource.DECK_CONFIG,
+            )
+            != identity.replay_key
+        ):
+            raise ValueError("replay semantics changed")
+        expected_identity = _RwkvHistoryPrefixIdentity(
+            identity.last_review_id,
+            identity.review_count,
+            identity.history_hash,
+        )
+        fingerprint = _rwkv_historical_review_fingerprint(
+            reviewer,
+            ignored_review_ids=_rwkv_state_cache_ignored_review_ids(metadata),
+            expected_identity=expected_identity,
+        )
+        if (
+            fingerprint is None
+            or not fingerprint.history_is_valid
+            or fingerprint.identity != expected_identity
+        ):
+            raise ValueError("history fingerprint does not match exactly")
+        with _reviewer_backend_state_lock:
+            if (
+                _reviewer_backend_revalidation_candidates.get(key) != candidate
+                or _reviewer_backend_warmup_generations.get(key, 0) != generation
+            ):
+                raise ValueError("candidate invalidated during validation")
+        return identity
+    except Exception as error:
+        with _reviewer_backend_state_lock:
+            # A newer invalidation may have re-armed the candidate for the
+            # same resident state; leave that one for its own check.
+            if _reviewer_backend_revalidation_candidates.get(key) == candidate:
+                _reviewer_backend_revalidation_candidates.pop(key, None)
+        logger.debug("RWKV resident state revalidation skipped: reason=%s", error)
+        return None
+
+
+def _warm_up_reviewer_backend(  # noqa: PLR0911
     reviewer: object,
     *,
     force_rebuild: bool = False,
@@ -9784,15 +10039,20 @@ def _warm_up_reviewer_backend(
     additional_ignored_review_ids: Sequence[int] = (),
     on_cache_persistence_error: Callable[[Exception], None] | None = None,
     discard_resident_state: bool = False,
+    revalidate_only: bool = False,
 ) -> bool:
+    if revalidate_only and (
+        force_rebuild or discard_resident_state or additional_ignored_review_ids
+    ):
+        return False
     context = _reviewer_backend_warmup_context(reviewer)
     if context is None:
-        return True
+        return not revalidate_only
     backend, key = context
 
     warm_up = getattr(backend, "warm_up", None)
     if not callable(warm_up):
-        return True
+        return not revalidate_only
 
     warmup_start = _begin_reviewer_backend_warmup(
         reviewer,
@@ -9819,7 +10079,38 @@ def _warm_up_reviewer_backend(
         )
 
     start = time.monotonic()
+    revalidated = False
     try:
+        if (
+            not force_rebuild
+            and not discard_resident_state
+            and not additional_ignored_review_ids
+        ):
+            identity = _revalidate_resident_reviewer_backend_state(
+                reviewer, key, warmup_generation
+            )
+            if identity is not None:
+                if not is_current():
+                    with _reviewer_backend_state_lock:
+                        _reviewer_backend_revalidation_candidates.pop(key, None)
+                    raise _ReviewerBackendWarmupInvalidated
+                if _publish_reviewer_backend_state(
+                    key, identity, expected_generation=warmup_generation
+                ):
+                    revalidated = True
+                    logger.debug(
+                        "RWKV resident state revalidated in place: elapsed_ms=%.1f",
+                        (time.monotonic() - start) * 1000,
+                    )
+                    return True
+                with _reviewer_backend_state_lock:
+                    _reviewer_backend_revalidation_candidates.pop(key, None)
+                logger.debug(
+                    "RWKV resident state revalidation skipped: reason=publication superseded"
+                )
+        if revalidate_only:
+            return False
+        _drop_reviewer_backend_revalidation_candidates(backend)
         logger.debug("RWKV historical warm-up started")
         _report_rwkv_state_cache_progress(
             progress,
@@ -9977,6 +10268,8 @@ def _warm_up_reviewer_backend(
         finally:
             try:
                 _finish_reviewer_backend_warmup(key, warmup_generation)
+                if revalidated:
+                    _refresh_ready_rwkv_state_cache_collection_mod(reviewer)
             finally:
                 _reviewer_backend_execution_lock.release()
 
@@ -10488,7 +10781,7 @@ def recompute_rwkv_calibration_data(
             )
             writer = _RwkvReviewRetrievabilityCacheWriter(
                 reviewer,
-                source="rwkv_calibration_recompute",
+                source=_RWKV_CALIBRATION_RECOMPUTE_SOURCE,
                 sample_role_by_review_id=sample_role_by_review_id,
                 fold_index_by_review_id=fold_index_by_review_id,
             )
@@ -10513,6 +10806,13 @@ def recompute_rwkv_calibration_data(
                 operation.require_current()
             finally:
                 writer.flush()
+            _prune_superseded_rwkv_calibration_rows(
+                reviewer,
+                history,
+                sample_role_by_review_id,
+                fold_index_by_review_id,
+            )
+            _write_rwkv_calibration_epoch(reviewer, history)
             logger.debug(
                 "RWKV calibration data recomputed: reviews=%s elapsed_ms=%.1f",
                 len(history.reviews),
@@ -10527,12 +10827,248 @@ def recompute_rwkv_calibration_data(
         return False
 
 
+def _prune_superseded_rwkv_calibration_rows(
+    reviewer: object,
+    history: RwkvHistoricalReviewInputs,
+    sample_role_by_review_id: Mapping[int, str],
+    fold_index_by_review_id: Mapping[int, int],
+) -> None:
+    """Delete calibration rows that the completed recompute replaced.
+
+    Earlier runs leave rows under roles and folds the current FSRS alignment no
+    longer assigns, plus legacy `rwkv_calibration_train` rows. Answer-time and
+    state-cache rows are other sources and stay untouched.
+    """
+
+    backend = getattr(_collection(reviewer), "_backend", None)
+    prune = getattr(backend, "prune_rwkv_review_retrievability_cache_rows", None)
+    if not callable(prune):
+        return
+    keep = [
+        scheduler_pb2.PruneRwkvReviewRetrievabilityCacheRowsRequest.Key(
+            revlog_id=review_id,
+            sample_role=sample_role_by_review_id.get(
+                review_id, _RWKV_RETRIEVABILITY_SAMPLE_ROLE_FINAL_FIT
+            ),
+            fold_index=fold_index_by_review_id.get(review_id, -1),
+        )
+        for review_id in history.review_ids
+    ]
+    try:
+        deleted = prune(
+            source=_RWKV_CALIBRATION_RECOMPUTE_SOURCE,
+            keep=keep,
+            superseded_sources=["rwkv_calibration_train"],
+        )
+    except Exception:
+        # The new rows are complete; stale ones only cost space until next run.
+        logger.exception("failed to prune superseded RWKV calibration rows")
+        return
+    logger.debug("pruned superseded RWKV calibration rows: deleted=%s", deleted)
+
+
+def _rwkv_calibration_epoch_from_metadata(
+    metadata: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    """Lineage fields that calibration predictions made on this state share.
+
+    A rebuild changes the store generation and a recovery writes a new segment;
+    both can change what every later answer would predict. Ignored reviews make
+    the state differ from the full history a recompute replays.
+    """
+
+    if metadata is None or _rwkv_state_cache_ignored_review_ids(metadata):
+        return None
+    epoch = {key: metadata.get(key) for key in _RWKV_CALIBRATION_EPOCH_KEYS}
+    if (
+        not isinstance(epoch["storeGeneration"], str)
+        or _int_value(epoch["snapshotSegmentId"]) is None
+        or not _rwkv_state_cache_model_usable(epoch["model"])
+    ):
+        return None
+    return epoch
+
+
+def _write_rwkv_calibration_epoch(
+    reviewer: object,
+    history: RwkvHistoricalReviewInputs,
+) -> None:
+    """Record the lineage a completed recompute matches.
+
+    Later answers on that lineage add their predictions to the same rows, and
+    a change of FSRS folds can then relabel them instead of replaying history.
+    """
+
+    cache_dir = _rwkv_state_cache_dir(reviewer)
+    if cache_dir is None:
+        return
+    path = cache_dir / _RWKV_CALIBRATION_EPOCH_FILE
+    metadata = _read_rwkv_state_cache_metadata(reviewer)
+    epoch = _rwkv_calibration_epoch_from_metadata(metadata)
+    try:
+        if epoch is None or not _rwkv_state_cache_metadata_usable(
+            reviewer,
+            metadata,
+            current_history=history,
+        ):
+            path.unlink(missing_ok=True)
+            return
+        _atomic_write(path, json.dumps(epoch, sort_keys=True).encode("utf8"))
+    except Exception:
+        logger.exception("failed to record RWKV calibration epoch")
+
+
+def _rwkv_calibration_epoch_current(reviewer: object) -> bool:
+    cache_dir = _rwkv_state_cache_dir(reviewer)
+    if cache_dir is None:
+        return False
+    try:
+        stored = json.loads(
+            (cache_dir / _RWKV_CALIBRATION_EPOCH_FILE).read_text(encoding="utf8")
+        )
+    except FileNotFoundError:
+        return False
+    except Exception:
+        logger.debug("failed to read RWKV calibration epoch", exc_info=True)
+        return False
+    current = _rwkv_calibration_epoch_from_metadata(
+        _read_rwkv_state_cache_metadata(reviewer)
+    )
+    return current is not None and stored == current
+
+
+def _rwkv_answer_calibration_prediction(
+    reviewer: object,
+    backend: object,
+    card: object,
+    ease: int,
+) -> float | None:
+    """Pre-answer prediction for an answer about to update the current epoch."""
+
+    predict = getattr(backend, "answered_review_retrievability", None)
+    if not callable(predict):
+        return None
+    try:
+        if not _rwkv_calibration_epoch_current(reviewer):
+            return None
+        return cast(float | None, predict(reviewer=reviewer, card=card, ease=ease))
+    except Exception:
+        logger.debug("RWKV answer calibration prediction failed", exc_info=True)
+        return None
+
+
+def _record_rwkv_answer_calibration_prediction(
+    reviewer: object,
+    card: object,
+    prediction: float,
+) -> None:
+    # A missing row only makes the next calibration refresh replay history, so
+    # recording must never fail the state update that already happened.
+    card_id = _card_id(card)
+    scalar = getattr(getattr(_collection(reviewer), "db", None), "scalar", None)
+    if card_id is None or not callable(scalar):
+        return
+    try:
+        review_id = scalar("select max(id) from revlog where cid = ?", card_id)
+        if not isinstance(review_id, int) or isinstance(review_id, bool):
+            return
+        writer = _RwkvReviewRetrievabilityCacheWriter(
+            reviewer,
+            source=_RWKV_CALIBRATION_RECOMPUTE_SOURCE,
+        )
+        writer.record(review_id, prediction)
+        writer.flush()
+    except Exception:
+        logger.exception("failed to record RWKV answer calibration prediction")
+
+
+def _realign_rwkv_calibration_data(
+    reviewer: object,
+    history: RwkvHistoricalReviewInputs,
+) -> bool:
+    """Assign the active FSRS folds to existing calibration predictions.
+
+    A prediction does not depend on its role, so when every historical answer
+    already has one from the current epoch, only the roles need rewriting.
+    """
+
+    try:
+        all_rows = getattr(getattr(_collection(reviewer), "db", None), "all", None)
+        if not callable(all_rows) or not _rwkv_calibration_epoch_current(reviewer):
+            return False
+        rows = all_rows(
+            f"""
+select revlog_id, prediction, sample_role, fold_index
+from {_RWKV_REVIEW_RETRIEVABILITY_CACHE_TABLE}
+where source = ?
+  and prediction between 0 and 1
+""",
+            _RWKV_CALIBRATION_RECOMPUTE_SOURCE,
+        )
+        predictions = {row[0]: row[1] for row in rows}
+        existing_keys = {(row[0], row[2], row[3]) for row in rows}
+        answered = [
+            review_id
+            for review_id, review_input in zip(
+                history.review_ids,
+                history.reviews,
+                strict=True,
+            )
+            if review_input.ease is not None
+        ]
+        if any(review_id not in predictions for review_id in answered):
+            return False
+
+        sample_role_by_review_id, fold_index_by_review_id = (
+            _rwkv_calibration_fold_role_maps(reviewer, history)
+        )
+        writer = _RwkvReviewRetrievabilityCacheWriter(
+            reviewer,
+            source=_RWKV_CALIBRATION_RECOMPUTE_SOURCE,
+            sample_role_by_review_id=sample_role_by_review_id,
+            fold_index_by_review_id=fold_index_by_review_id,
+        )
+        for review_id in answered:
+            key = (
+                review_id,
+                sample_role_by_review_id.get(
+                    review_id, _RWKV_RETRIEVABILITY_SAMPLE_ROLE_FINAL_FIT
+                ),
+                fold_index_by_review_id.get(review_id, -1),
+            )
+            if key not in existing_keys:
+                writer.record(review_id, predictions[review_id])
+        writer.flush()
+        _prune_superseded_rwkv_calibration_rows(
+            reviewer,
+            history,
+            sample_role_by_review_id,
+            fold_index_by_review_id,
+        )
+    except Exception:
+        logger.exception("RWKV calibration relabel failed")
+        return False
+    # Also confirms the state lineage still matches the current history.
+    return _rwkv_calibration_data_available(reviewer, history=history)
+
+
 def rwkv_calibration_data_available(mw: object) -> bool:
     """Return whether current, role-aware historical RWKV predictions exist."""
 
-    reviewer = SimpleNamespace(mw=mw)
+    return _rwkv_calibration_data_available(SimpleNamespace(mw=mw))
+
+
+def _rwkv_calibration_data_available(
+    reviewer: object,
+    *,
+    history: RwkvHistoricalReviewInputs | None = None,
+) -> bool:
     metadata = _read_rwkv_state_cache_metadata(reviewer)
-    if metadata is None or not _rwkv_state_cache_metadata_usable(reviewer, metadata):
+    if metadata is None or not _rwkv_state_cache_metadata_usable(
+        reviewer,
+        metadata,
+        current_history=history,
+    ):
         return False
 
     last_review_id = _int_value(metadata.get("lastReviewId"))
@@ -10583,11 +11119,20 @@ def ensure_rwkv_calibration_data(
     """Generate role-aware historical RWKV predictions when they are missing.
 
     This synchronous API is intended for add-ons running in a background task.
-    Existing complete data is a fast no-op. The active reviewer state is
+    Existing complete data is a fast no-op, and changed FSRS folds only relabel
+    predictions that already exist. Otherwise the active reviewer state is
     snapshotted and restored by `recompute_rwkv_calibration_data()`.
     """
 
-    if rwkv_calibration_data_available(mw):
+    reviewer = SimpleNamespace(mw=mw)
+    try:
+        history = _historical_rwkv_review_inputs(reviewer)
+    except Exception:
+        logger.debug("RWKV calibration history unavailable", exc_info=True)
+        return recompute_rwkv_calibration_data(mw, progress=progress)
+    if _rwkv_calibration_data_available(reviewer, history=history):
+        return True
+    if _realign_rwkv_calibration_data(reviewer, history):
         return True
     return recompute_rwkv_calibration_data(mw, progress=progress)
 
@@ -11630,6 +12175,84 @@ def load_rwkv_state_cache_with_progress(
             raise
 
     _run_on_main(mw, start_load)
+
+
+def revalidate_rwkv_state_after_legacy_reset(mw: object) -> None:
+    """Coalesce legacy resets into one silent check of the retained state."""
+
+    reviewer = SimpleNamespace(mw=mw)
+    collection = _collection(reviewer)
+    key = _reviewer_backend_warmup_key(reviewer)
+
+    def can_revalidate() -> bool:
+        if (
+            key is None
+            or _collection(reviewer) is not collection
+            or _reviewer_backend_warmup_key(reviewer) != key
+            or not _rwkv_collection_config_state(reviewer).review_enabled
+            or rwkv_state_cache_loading(mw)
+        ):
+            return False
+        with _reviewer_backend_state_lock:
+            return key in _reviewer_backend_revalidation_candidates
+
+    if not can_revalidate() or getattr(
+        mw, "_rwkv_legacy_reset_revalidation_scheduled", False
+    ):
+        return
+
+    progress = getattr(mw, "progress", None)
+    single_shot = getattr(progress, "single_shot", None)
+    run_in_background = getattr(getattr(mw, "taskman", None), "run_in_background", None)
+    if not callable(single_shot) or not callable(run_in_background):
+        return
+    setattr(mw, "_rwkv_legacy_reset_revalidation_scheduled", True)
+
+    def revalidate() -> bool:
+        return can_revalidate() and _warm_up_reviewer_backend(
+            reviewer, revalidate_only=True
+        )
+
+    def done(future: Future[bool]) -> None:
+        setattr(mw, "_rwkv_legacy_reset_revalidation_scheduled", False)
+        try:
+            ready = future.result()
+        except Exception:
+            logger.debug("RWKV legacy reset revalidation failed", exc_info=True)
+            return
+        logger.debug("RWKV legacy reset revalidation finished: ready=%s", ready)
+        if not ready:
+            # Another reset during the check re-armed a newer candidate.
+            revalidate_rwkv_state_after_legacy_reset(mw)
+            return
+        if (
+            _collection(reviewer) is not collection
+            or _reviewer_backend_warmup_key(reviewer) != key
+            or not _rwkv_resident_state_ready(mw)
+        ):
+            return
+        _refresh_active_rwkv_count_view(mw)
+        from aqt import gui_hooks
+
+        gui_hooks.rwkv_state_did_prepare(cast(Any, mw))
+        if getattr(mw, "state", None) == "review":
+            getattr(mw, "reviewer").op_executed(
+                collection_pb2.OpChanges(study_queues=True), None, focused=True
+            )
+
+    def start_revalidation() -> None:
+        if not can_revalidate():
+            setattr(mw, "_rwkv_legacy_reset_revalidation_scheduled", False)
+            return
+        try:
+            run_in_background(revalidate, done, uses_collection=True)
+        except Exception:
+            setattr(mw, "_rwkv_legacy_reset_revalidation_scheduled", False)
+            logger.debug(
+                "failed to start RWKV legacy reset revalidation", exc_info=True
+            )
+
+    single_shot(500, start_revalidation, requires_collection=False)
 
 
 def refresh_rwkv_state_after_sync(
@@ -14360,6 +14983,7 @@ def _restore_reviewer_backend_cache(
     if not callable(restore_snapshot) or not callable(warm_up):
         return None
 
+    _drop_reviewer_backend_revalidation_candidates(backend)
     stored = _read_rwkv_state_cache(
         reviewer,
         backend=backend,
@@ -16019,6 +16643,7 @@ class _SpeculativeRwkvStateStoreRestore:
             backend,
             (cache_dir / _RWKV_STATE_CACHE_STORE_FILE, store_generation, segment_id),
         )
+        _drop_reviewer_backend_revalidation_candidates(backend)
         restore._thread.start()
         return restore
 
@@ -19338,24 +19963,10 @@ def _rwkv_review_dynamic_preset_replay(deck_config: dict[str, object]) -> bool:
 
 
 def _rwkv_review_first_review_elapsed_from_card_creation(
-    deck_config: dict[str, object],
+    _deck_config: dict[str, object],
 ) -> bool:
-    nested = _rwkv_other_config(deck_config)
-    if nested is not None:
-        value = nested.get("rwkv_review_first_review_elapsed_from_card_creation")
-        if isinstance(value, bool):
-            return value
-
-    value = _rwkv_config_direct_value(
-        deck_config,
-        "rwkvReviewFirstReviewElapsedFromCardCreation",
-        "rwkv_review_first_review_elapsed_from_card_creation",
-    )
-    return (
-        value
-        if isinstance(value, bool)
-        else _DEFAULT_RWKV_REVIEW_FIRST_REVIEW_ELAPSED_FROM_CARD_CREATION
-    )
+    # Retain legacy storage, but creation time is now always used for queries.
+    return True
 
 
 def _new_gather_uses_retrievability(deck_config: dict[str, object]) -> bool:
@@ -19817,9 +20428,11 @@ def collection_content_did_change(mw: object, initiator: object | None) -> None:
     """Refresh content-dependent inputs without discarding unchanged RWKV state."""
 
     reviewer = SimpleNamespace(mw=mw)
-    if _consume_reconciled_collection_change(reviewer):
+    reconciled_change = _take_reconciled_collection_change(reviewer)
+    if reconciled_change is not None:
         _preserve_reconciled_non_queue_collection_change(
             reviewer,
+            reconciled_change,
             reason="collection content mutation",
         )
         return
@@ -19949,8 +20562,7 @@ def _changed_cards_keep_rwkv_preset_routing(
         return False
     previous_preset_ids = {card_id: cache[card_id] for card_id in historical_card_ids}
 
-    _invalidate_resolved_preset_id_cache(reviewer, card_ids=card_ids)
-    current_preset_ids = _resolved_fsrs_preset_ids(reviewer, card_ids)
+    current_preset_ids = _refresh_resolved_fsrs_preset_ids(reviewer, card_ids)
     return all(
         current_preset_ids.get(card_id) == previous_preset_id
         for card_id, previous_preset_id in previous_preset_ids.items()
@@ -19995,9 +20607,11 @@ def fsrs_preset_resolution_did_change(mw: object) -> None:
     """Discard resident state and preset assignments after collection changes."""
 
     reviewer = SimpleNamespace(mw=mw)
-    if _consume_reconciled_collection_change(reviewer):
+    reconciled_change = _take_reconciled_collection_change(reviewer)
+    if reconciled_change is not None:
         _preserve_reconciled_non_queue_collection_change(
             reviewer,
+            reconciled_change,
             reason="collection routing mutation",
         )
         return
@@ -20005,6 +20619,7 @@ def fsrs_preset_resolution_did_change(mw: object) -> None:
     _invalidate_reviewer_backend_state(
         reviewer,
         reason="collection routing mutation",
+        keep_revalidation_candidate=True,
     )
     _invalidate_resolved_preset_id_cache(reviewer)
 
@@ -20076,12 +20691,14 @@ def _prune_removed_cards_from_review_queue_scores(
 
 def _preserve_reconciled_non_queue_collection_change(
     reviewer: object,
+    reconciled_change: _RwkvReconciledCollectionChange,
     *,
     reason: str,
 ) -> None:
     mw = getattr(reviewer, "mw", None)
     generation = _invalidate_rwkv_review_input_caches(mw)
-    _invalidate_resolved_preset_id_cache(reviewer)
+    if not reconciled_change.card_ids:
+        _invalidate_resolved_preset_id_cache(reviewer)
     _refresh_ready_rwkv_state_cache_collection_mod(reviewer)
     logger.debug(
         "RWKV resident state retained after reconciled %s: generation=%s",
@@ -20158,6 +20775,7 @@ def study_queues_did_change(
         _invalidate_reviewer_backend_state(
             transient_reviewer,
             reason="study queue mutation",
+            keep_revalidation_candidate=True,
         )
     with _reviewer_backend_state_lock:
         _rwkv_study_queue_generation += 1

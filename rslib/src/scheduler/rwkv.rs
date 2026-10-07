@@ -447,7 +447,7 @@ impl Collection {
 
         for card in cards {
             let Some(state) =
-                self.rwkv_review_input_state(&card, timing, include_suspended_review, false)?
+                self.rwkv_review_input_state(&card, timing, include_suspended_review, true)?
             else {
                 continue;
             };
@@ -468,16 +468,6 @@ impl Collection {
                 disabled_config_cards += 1;
                 continue;
             }
-            let state = if config
-                .inner
-                .rwkv_review_first_review_elapsed_from_card_creation
-            {
-                self.rwkv_review_input_state(&card, timing, include_suspended_review, true)?
-                    .unwrap_or(state)
-            } else {
-                state
-            };
-
             eligible.push(RwkvReviewInputRowPartial {
                 target_retention: deck.effective_desired_retention(config),
                 batch_size: config.inner.rwkv_review_batch_size,
@@ -619,7 +609,7 @@ impl Collection {
         Ok(card.last_review_time)
     }
 
-    fn populate_rwkv_last_review_times(&self, cards: &mut [Card]) -> Result<()> {
+    pub(crate) fn populate_rwkv_last_review_times(&self, cards: &mut [Card]) -> Result<()> {
         let missing_card_ids: Vec<_> = cards
             .iter()
             .filter(|card| card.last_review_time.is_none())
@@ -714,8 +704,7 @@ pub(crate) fn rwkv_review_candidate_metadata(
     let mut metadata = HashMap::with_capacity(cards.len());
     let mut partial_by_card = HashMap::new();
     let mut without_card_target = Vec::new();
-    let same_day_review_allowed = !col.get_config_bool(BoolKey::Fsrs)
-        || col.get_config_bool(BoolKey::FsrsShortTermWithStepsEnabled);
+    let same_day_review_allowed = col.get_config_bool(BoolKey::FsrsShortTermWithStepsEnabled);
 
     for card in cards {
         if card.queue != CardQueue::Review {
@@ -768,7 +757,6 @@ pub(crate) enum RwkvReviewScoreEligibility {
 pub(crate) fn rwkv_review_score_eligibility(
     score: f32,
     metadata: &RwkvReviewCandidateMetadata,
-    allow_same_day_review: bool,
     min_intervening_reviews: u32,
     min_elapsed_secs: u32,
     intervening_reviews: Option<u32>,
@@ -777,7 +765,6 @@ pub(crate) fn rwkv_review_score_eligibility(
     rwkv_review_score_eligibility_inner(
         score,
         metadata,
-        allow_same_day_review,
         min_intervening_reviews,
         min_elapsed_secs,
         intervening_reviews,
@@ -788,7 +775,6 @@ pub(crate) fn rwkv_review_score_eligibility(
 pub(crate) fn rwkv_review_score_eligibility_ignoring_retention(
     score: f32,
     metadata: &RwkvReviewCandidateMetadata,
-    allow_same_day_review: bool,
     min_intervening_reviews: u32,
     min_elapsed_secs: u32,
     intervening_reviews: Option<u32>,
@@ -796,7 +782,6 @@ pub(crate) fn rwkv_review_score_eligibility_ignoring_retention(
     rwkv_review_score_eligibility_inner(
         score,
         metadata,
-        allow_same_day_review,
         min_intervening_reviews,
         min_elapsed_secs,
         intervening_reviews,
@@ -836,7 +821,6 @@ fn rwkv_review_target_retention(
 fn rwkv_review_score_eligibility_inner(
     score: f32,
     metadata: &RwkvReviewCandidateMetadata,
-    allow_same_day_review: bool,
     min_intervening_reviews: u32,
     min_elapsed_secs: u32,
     intervening_reviews: Option<u32>,
@@ -851,17 +835,29 @@ fn rwkv_review_score_eligibility_inner(
 
     if !score.is_finite()
         || score_above_target
-        || (metadata.reviewed_today
-            && (!allow_same_day_review || !metadata.same_day_review_allowed))
+        || (metadata.reviewed_today && !metadata.same_day_review_allowed)
     {
         return RwkvReviewScoreEligibility::Blocked;
     }
 
+    rwkv_repeat_spacing_eligibility(
+        metadata.elapsed_secs_since_last_review,
+        min_intervening_reviews,
+        min_elapsed_secs,
+        intervening_reviews,
+    )
+}
+
+pub(crate) fn rwkv_repeat_spacing_eligibility(
+    elapsed_secs_since_last_review: Option<u32>,
+    min_intervening_reviews: u32,
+    min_elapsed_secs: u32,
+    intervening_reviews: Option<u32>,
+) -> RwkvReviewScoreEligibility {
     let required_intervening_reviews =
         (!rwkv_review_intervening_reviews_elapsed(intervening_reviews, min_intervening_reviews))
             .then_some(min_intervening_reviews);
-    let remaining_elapsed_secs = metadata
-        .elapsed_secs_since_last_review
+    let remaining_elapsed_secs = elapsed_secs_since_last_review
         .filter(|elapsed_secs| *elapsed_secs < min_elapsed_secs)
         .map(|elapsed_secs| min_elapsed_secs - elapsed_secs);
     if required_intervening_reviews.is_some() || remaining_elapsed_secs.is_some() {
@@ -972,13 +968,7 @@ fn rwkv_first_review_uses_card_creation(
             requested_values_by_config_id
                 .get(&config_id.0)
                 .copied()
-                .or_else(|| {
-                    configs_by_id.get(&config_id).map(|config| {
-                        config
-                            .inner
-                            .rwkv_review_first_review_elapsed_from_card_creation
-                    })
-                })
+                .or_else(|| configs_by_id.get(&config_id).map(|_| true))
                 .unwrap_or(false)
         })
 }
@@ -1651,7 +1641,7 @@ mod test {
         let mut col = Collection::new();
         col.update_default_deck_config(|config| {
             config.rwkv_review_enabled = true;
-            config.rwkv_review_first_review_elapsed_from_card_creation = true;
+            config.rwkv_review_first_review_elapsed_from_card_creation = false;
         });
         let timing = col.timing_today()?;
         let mut card = Card::new(NoteId(10), 0, DeckId(1), timing.days_elapsed as i32);
@@ -1816,7 +1806,7 @@ mod test {
         let mut col = Collection::new();
         col.update_default_deck_config(|config| {
             config.rwkv_review_enabled = true;
-            config.rwkv_review_first_review_elapsed_from_card_creation = true;
+            config.rwkv_review_first_review_elapsed_from_card_creation = false;
         });
         let deck = col.get_or_create_normal_deck("Default")?;
         let timing = col.timing_today()?;

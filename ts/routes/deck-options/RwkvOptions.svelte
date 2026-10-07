@@ -25,6 +25,7 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     import type { HelpItem } from "$lib/components/types";
 
     import { commitEditing, type DeckOptionsState, fsrsParams } from "./lib";
+    import RwkvRepeatSpacing from "./RwkvRepeatSpacing.svelte";
     import SimulatorModal from "./SimulatorModal.svelte";
     import { buildSimulateFsrsRequest } from "./simulate-fsrs-request";
     import SpinBoxFloatRow from "./SpinBoxFloatRow.svelte";
@@ -102,17 +103,9 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
         reschedulingRwkvReviewCards;
 
     const settings = {
-        rwkvReview: {
-            title: tr.deckConfigRwkvReviewEnabled(),
-            help: tr.deckConfigRwkvReviewEnabledTooltip(),
-        },
         rwkvEnforceGradeOrder: {
             title: tr.deckConfigRwkvReviewEnforceGradeOrder(),
             help: tr.deckConfigRwkvReviewEnforceGradeOrderTooltip(),
-        },
-        rwkvInstantOrder: {
-            title: tr.deckConfigRwkvReviewInstantOrder(),
-            help: tr.deckConfigRwkvReviewInstantOrderTooltip(),
         },
         rwkvMinimumReviewsPerDay: {
             title: tr.deckConfigRwkvReviewMinimumReviewsPerDay(),
@@ -126,29 +119,13 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
             title: tr.deckConfigRwkvReviewRefreshInterval(),
             help: tr.deckConfigRwkvReviewRefreshIntervalTooltip(),
         },
-        rwkvRefreshOnExit: {
-            title: tr.deckConfigRwkvReviewRefreshOnExit(),
-            help: tr.deckConfigRwkvReviewRefreshOnExitTooltip(),
-        },
-        rwkvAllowSameDayReview: {
-            title: tr.deckConfigRwkvReviewAllowSameDayReview(),
-            help: tr.deckConfigRwkvReviewAllowSameDayReviewTooltip(),
-        },
         rwkvFirstReviewElapsed: {
             title: tr.deckConfigRwkvReviewFirstReviewElapsedFromCardCreation(),
             help: tr.deckConfigRwkvReviewFirstReviewElapsedFromCardCreationTooltip(),
         },
-        rwkvMinInterveningReviews: {
-            title: tr.deckConfigRwkvReviewMinInterveningReviews(),
-            help: tr.deckConfigRwkvReviewMinInterveningReviewsTooltip(),
-        },
-        rwkvMinElapsedSecs: {
-            title: tr.deckConfigRwkvReviewMinElapsedSecs(),
-            help: tr.deckConfigRwkvReviewMinElapsedSecsTooltip(),
-        },
-        rwkvDynamicPresetReplay: {
-            title: tr.deckConfigRwkvReviewDynamicPresetReplay(),
-            help: tr.deckConfigRwkvReviewDynamicPresetReplayTooltip(),
+        rwkvRepeatSpacing: {
+            title: tr.deckConfigRwkvRepeatSpacingTitle(),
+            help: tr.deckConfigRwkvRepeatSpacingTooltip(),
         },
     };
     const settingKeys = Object.keys(settings);
@@ -224,185 +201,123 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     }
 </script>
 
-<TitledContainer title={"RWKV"}>
-    <HelpModal
-        title={"RWKV"}
-        url=""
-        slot="tooltip"
-        {helpSections}
-        on:mount={(e) => {
-            modal = e.detail.modal;
-            carousel = e.detail.carousel;
-        }}
-    />
-    <DynamicallySlottable slotHost={Item} api={{}}>
-        <h2 class="rwkv-subheading">Answer Button Intervals — RWKV-Curve</h2>
+{#if $config.rwkvReviewEnabled || $config.rwkvReviewInstantOrderEnabled}
+    <TitledContainer title={"RWKV"}>
+        <HelpModal
+            title={"RWKV"}
+            url=""
+            slot="tooltip"
+            {helpSections}
+            on:mount={(e) => {
+                modal = e.detail.modal;
+                carousel = e.detail.carousel;
+            }}
+        />
+        <DynamicallySlottable slotHost={Item} api={{}}>
+            {#if $config.rwkvReviewInstantOrderEnabled}
+                <div class="rwkv-mode-heading">
+                    <h2>RWKV-Instant</h2>
+                    <span class="rwkv-mode-badge">
+                        {tr.deckConfigRwkvRecommended()}
+                    </span>
+                    <span class="rwkv-mode-subtitle">
+                        {tr.deckConfigRwkvInstantSubtitle()}
+                    </span>
+                </div>
+                <p class="rwkv-description">{tr.deckConfigRwkvInstantDescription()}</p>
 
-        <Item>
-            <SwitchRow
-                bind:value={$config.rwkvReviewEnabled}
-                defaultValue={defaults.rwkvReviewEnabled}
-            >
-                <SettingTitle on:click={() => openSettingHelp("rwkvReview")}>
-                    {tr.deckConfigRwkvReviewEnabled()}
-                </SettingTitle>
-            </SwitchRow>
-        </Item>
-
-        <Item>
-            <SwitchRow
-                bind:value={$config.rwkvReviewEnforceGradeOrder}
-                defaultValue={defaults.rwkvReviewEnforceGradeOrder}
-            >
-                <SettingTitle on:click={() => openSettingHelp("rwkvEnforceGradeOrder")}>
-                    {tr.deckConfigRwkvReviewEnforceGradeOrder()}
-                </SettingTitle>
-            </SwitchRow>
-        </Item>
-
-        {#if $config.rwkvReviewEnabled && isDesktop()}
-            <button
-                class="btn btn-outline-primary"
-                disabled={rwkvActionInProgress}
-                on:click={() => rescheduleRwkvReviewCards()}
-            >
-                {#if reschedulingRwkvReviewCards}
-                    Rescheduling Cards with RWKV-Curve Intervals...
-                {:else}
-                    Reschedule Cards with RWKV-Curve Intervals
-                {/if}
-            </button>
-        {/if}
-
-        <h2 class="rwkv-subheading">Review Queue — RWKV-Instant</h2>
-
-        <SwitchRow
-            bind:value={$config.rwkvReviewInstantOrderEnabled}
-            defaultValue={defaults.rwkvReviewInstantOrderEnabled}
-        >
-            <SettingTitle on:click={() => openSettingHelp("rwkvInstantOrder")}>
-                {tr.deckConfigRwkvReviewInstantOrder()}
-            </SettingTitle>
-            <span class="rwkv-recommendation">
-                {tr.deckConfigRwkvReviewInstantOrderRecommended()}
-            </span>
-        </SwitchRow>
-
-        {#if $config.rwkvReviewInstantOrderEnabled}
-            <SpinBoxFloatRow
-                bind:value={$config.rwkvReviewMinimumReviewsPerDay}
-                defaultValue={defaults.rwkvReviewMinimumReviewsPerDay}
-                min={0}
-                max={9999}
-                step={1}
-            >
-                <SettingTitle
-                    on:click={() => openSettingHelp("rwkvMinimumReviewsPerDay")}
-                >
-                    {tr.deckConfigRwkvReviewMinimumReviewsPerDay()}
-                </SettingTitle>
-            </SpinBoxFloatRow>
-
-            <SwitchRow
-                bind:value={$config.rwkvReviewCandidateRefreshEnabled}
-                defaultValue={defaults.rwkvReviewCandidateRefreshEnabled}
-            >
-                <SettingTitle on:click={() => openSettingHelp("rwkvCandidateRefresh")}>
-                    {tr.deckConfigRwkvReviewCandidateRefresh()}
-                </SettingTitle>
-            </SwitchRow>
-
-            <SpinBoxFloatRow
-                bind:value={$config.rwkvReviewRefreshInterval}
-                defaultValue={defaults.rwkvReviewRefreshInterval}
-                min={1}
-                max={10000}
-                step={1}
-            >
-                <SettingTitle on:click={() => openSettingHelp("rwkvRefreshInterval")}>
-                    {tr.deckConfigRwkvReviewRefreshInterval()}
-                </SettingTitle>
-            </SpinBoxFloatRow>
-
-            <SwitchRow
-                bind:value={$config.rwkvReviewRefreshOnExit}
-                defaultValue={defaults.rwkvReviewRefreshOnExit}
-            >
-                <SettingTitle on:click={() => openSettingHelp("rwkvRefreshOnExit")}>
-                    {tr.deckConfigRwkvReviewRefreshOnExit()}
-                </SettingTitle>
-            </SwitchRow>
-
-            <h2 class="rwkv-subheading">Same-Day Repeats</h2>
-
-            <SwitchRow
-                bind:value={$config.rwkvReviewAllowSameDayReview}
-                defaultValue={defaults.rwkvReviewAllowSameDayReview}
-            >
-                <SettingTitle
-                    on:click={() => openSettingHelp("rwkvAllowSameDayReview")}
-                >
-                    {tr.deckConfigRwkvReviewAllowSameDayReview()}
-                </SettingTitle>
-            </SwitchRow>
-
-            {#if $config.rwkvReviewAllowSameDayReview}
+                <p class="rwkv-recommendation">
+                    {tr.deckConfigRwkvReviewInstantOrderRecommended()}
+                </p>
                 <SpinBoxFloatRow
-                    bind:value={$config.rwkvReviewMinInterveningReviews}
-                    defaultValue={defaults.rwkvReviewMinInterveningReviews}
+                    bind:value={$config.rwkvReviewMinimumReviewsPerDay}
+                    defaultValue={defaults.rwkvReviewMinimumReviewsPerDay}
                     min={0}
+                    max={9999}
+                    step={1}
+                >
+                    <SettingTitle
+                        on:click={() => openSettingHelp("rwkvMinimumReviewsPerDay")}
+                    >
+                        {tr.deckConfigRwkvReviewMinimumReviewsPerDay()}
+                    </SettingTitle>
+                </SpinBoxFloatRow>
+
+                <SwitchRow
+                    bind:value={$config.rwkvReviewCandidateRefreshEnabled}
+                    defaultValue={defaults.rwkvReviewCandidateRefreshEnabled}
+                >
+                    <SettingTitle
+                        on:click={() => openSettingHelp("rwkvCandidateRefresh")}
+                    >
+                        {tr.deckConfigRwkvReviewCandidateRefresh()}
+                    </SettingTitle>
+                </SwitchRow>
+
+                <SpinBoxFloatRow
+                    bind:value={$config.rwkvReviewRefreshInterval}
+                    defaultValue={defaults.rwkvReviewRefreshInterval}
+                    min={1}
                     max={10000}
                     step={1}
                 >
                     <SettingTitle
-                        on:click={() => openSettingHelp("rwkvMinInterveningReviews")}
+                        on:click={() => openSettingHelp("rwkvRefreshInterval")}
                     >
-                        {tr.deckConfigRwkvReviewMinInterveningReviews()}
+                        {tr.deckConfigRwkvReviewRefreshInterval()}
                     </SettingTitle>
                 </SpinBoxFloatRow>
 
-                <SpinBoxFloatRow
-                    bind:value={$config.rwkvReviewMinElapsedSecs}
-                    defaultValue={defaults.rwkvReviewMinElapsedSecs}
-                    min={0}
-                    max={86400}
-                    step={1}
-                >
-                    <SettingTitle
-                        on:click={() => openSettingHelp("rwkvMinElapsedSecs")}
-                    >
-                        {tr.deckConfigRwkvReviewMinElapsedSecs()}
-                    </SettingTitle>
-                </SpinBoxFloatRow>
+                <h2 class="rwkv-subheading">Same-Day Repeats</h2>
+
+                <RwkvRepeatSpacing
+                    bind:reviews={$config.rwkvReviewMinInterveningReviews}
+                    bind:seconds={$config.rwkvReviewMinElapsedSecs}
+                    defaultReviews={defaults.rwkvReviewMinInterveningReviews}
+                    defaultSeconds={defaults.rwkvReviewMinElapsedSecs}
+                    onHelp={() => openSettingHelp("rwkvRepeatSpacing")}
+                />
             {/if}
-        {/if}
 
-        {#if $config.rwkvReviewEnabled || $config.rwkvReviewInstantOrderEnabled}
-            <h2 class="rwkv-subheading">New Cards</h2>
-
-            <SwitchRow
-                bind:value={$config.rwkvReviewFirstReviewElapsedFromCardCreation}
-                defaultValue={defaults.rwkvReviewFirstReviewElapsedFromCardCreation}
-            >
-                <SettingTitle
-                    on:click={() => openSettingHelp("rwkvFirstReviewElapsed")}
+            {#if $config.rwkvReviewEnabled}
+                <div
+                    class="rwkv-mode-heading"
+                    class:rwkv-mode-divider={$config.rwkvReviewInstantOrderEnabled}
                 >
-                    {tr.deckConfigRwkvReviewFirstReviewElapsedFromCardCreation()}
-                </SettingTitle>
-            </SwitchRow>
+                    <h2>RWKV-Curve</h2>
+                    <span class="rwkv-mode-subtitle">
+                        {tr.deckConfigRwkvCurveSubtitle()}
+                    </span>
+                </div>
+                <p class="rwkv-description">{tr.deckConfigRwkvCurveDescription()}</p>
 
-            <h2 class="rwkv-subheading">Card History</h2>
+                <Item>
+                    <SwitchRow
+                        bind:value={$config.rwkvReviewEnforceGradeOrder}
+                        defaultValue={defaults.rwkvReviewEnforceGradeOrder}
+                    >
+                        <SettingTitle
+                            on:click={() => openSettingHelp("rwkvEnforceGradeOrder")}
+                        >
+                            {tr.deckConfigRwkvReviewEnforceGradeOrder()}
+                        </SettingTitle>
+                    </SwitchRow>
+                </Item>
 
-            <SwitchRow
-                bind:value={$config.rwkvReviewDynamicPresetReplay}
-                defaultValue={defaults.rwkvReviewDynamicPresetReplay}
-            >
-                <SettingTitle
-                    on:click={() => openSettingHelp("rwkvDynamicPresetReplay")}
-                >
-                    {tr.deckConfigRwkvReviewDynamicPresetReplay()}
-                </SettingTitle>
-            </SwitchRow>
+                {#if isDesktop()}
+                    <button
+                        class="btn btn-outline-primary"
+                        disabled={rwkvActionInProgress}
+                        on:click={() => rescheduleRwkvReviewCards()}
+                    >
+                        {#if reschedulingRwkvReviewCards}
+                            Rescheduling Cards with RWKV-Curve Intervals...
+                        {:else}
+                            Reschedule Cards with RWKV-Curve Intervals
+                        {/if}
+                    </button>
+                {/if}
+            {/if}
 
             {#if !isDesktop()}
                 <h2 class="rwkv-subheading">Maintenance</h2>
@@ -421,53 +336,50 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
                     </button>
                 </div>
                 <p class="mt-2 mb-0">{offlineRwkvStatus}</p>
+            {:else}
+                <h2 class="rwkv-subheading">Maintenance</h2>
+
+                <div class="d-flex flex-wrap gap-2">
+                    <button
+                        class="btn btn-outline-primary"
+                        disabled={rwkvActionInProgress}
+                        on:click={() => forceBuildRwkvStateCache()}
+                    >
+                        {#if forceBuildingRwkvStateCache}
+                            Rebuilding RWKV State...
+                        {:else}
+                            Rebuild RWKV State
+                        {/if}
+                    </button>
+
+                    <button
+                        class="btn btn-outline-primary"
+                        disabled={rwkvActionInProgress}
+                        on:click={() => recomputeRwkvCalibrationData()}
+                    >
+                        {#if recomputingRwkvCalibrationData}
+                            Calculating Calibration Graph Data...
+                        {:else}
+                            Calculate Calibration Graph Data
+                        {/if}
+                    </button>
+                </div>
+
+                <h2 class="rwkv-subheading">Compare</h2>
+
+                <div class="d-flex flex-wrap gap-2">
+                    <button
+                        class="btn btn-outline-primary"
+                        disabled={rwkvActionInProgress}
+                        on:click={() => showRwkvWorkloadModal()}
+                    >
+                        Compare RWKV with FSRS
+                    </button>
+                </div>
             {/if}
-            {#if isDesktop()}
-            <h2 class="rwkv-subheading">Maintenance</h2>
-
-            <div class="d-flex flex-wrap gap-2">
-                <button
-                    class="btn btn-outline-primary"
-                    disabled={rwkvActionInProgress}
-                    on:click={() => forceBuildRwkvStateCache()}
-                >
-                    {#if forceBuildingRwkvStateCache}
-                        Rebuilding RWKV State...
-                    {:else}
-                        Rebuild RWKV State
-                    {/if}
-                </button>
-
-                <button
-                    class="btn btn-outline-primary"
-                    disabled={rwkvActionInProgress}
-                    on:click={() => recomputeRwkvCalibrationData()}
-                >
-                    {#if recomputingRwkvCalibrationData}
-                        Calculating Calibration Graph Data...
-                    {:else}
-                        Calculate Calibration Graph Data
-                    {/if}
-                </button>
-            </div>
-            {/if}
-
-            {#if isDesktop()}
-            <h2 class="rwkv-subheading">Compare</h2>
-
-            <div class="d-flex flex-wrap gap-2">
-                <button
-                    class="btn btn-outline-primary"
-                    disabled={rwkvActionInProgress}
-                    on:click={() => showRwkvWorkloadModal()}
-                >
-                    Compare RWKV with FSRS
-                </button>
-            </div>
-            {/if}
-        {/if}
-    </DynamicallySlottable>
-</TitledContainer>
+        </DynamicallySlottable>
+    </TitledContainer>
+{/if}
 
 <SimulatorModal
     bind:modal={rwkvWorkloadModal}
@@ -482,6 +394,51 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 />
 
 <style>
+    .rwkv-mode-heading {
+        align-items: center;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.375rem 0.625rem;
+        margin: 1.25rem 0 0.375rem;
+    }
+
+    .rwkv-mode-heading h2 {
+        color: var(--fg);
+        font-size: 1.0625rem;
+        font-weight: 600;
+        line-height: 1.4;
+        margin: 0;
+    }
+
+    .rwkv-mode-subtitle {
+        color: var(--fg-subtle);
+        font-size: 0.8125rem;
+    }
+
+    .rwkv-mode-badge {
+        background: var(--canvas-inset);
+        border: 1px solid var(--border-subtle);
+        border-radius: 1rem;
+        color: var(--fg-link);
+        font-size: 0.6875rem;
+        font-weight: 500;
+        line-height: 1.4;
+        padding: 0.125rem 0.5rem;
+    }
+
+    .rwkv-mode-divider {
+        border-top: 1px solid var(--border-subtle);
+        margin-top: 1.5rem;
+        padding-top: 1.25rem;
+    }
+
+    .rwkv-description {
+        color: var(--fg-subtle);
+        font-size: 0.875rem;
+        font-style: italic;
+        margin: 0.25rem 0 1rem;
+    }
+
     .rwkv-subheading {
         color: var(--fg-subtle);
         font-size: 0.875rem;

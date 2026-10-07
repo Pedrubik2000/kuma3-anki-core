@@ -328,20 +328,36 @@ deck-config-interval-modifier-tooltip =
 deck-config-hard-interval-tooltip = The multiplier applied to a review interval when answering `Hard`.
 deck-config-new-interval-tooltip = The multiplier applied to a review interval when answering `Again`.
 deck-config-minimum-interval-tooltip = The minimum interval given to a review card after answering `Again`.
+deck-config-rwkv-description =
+    RWKV is a neural network designed to improve predictions of retrievability:
+    the chance of remembering a card. It has two variants: Curve sets answer
+    intervals, while Instant selects reviews. Instant is recommended, but it
+    adapts to your reviews on the fly, so the due count can fluctuate considerably
+    during a session. Setting a daily review limit is recommended.
+deck-config-rwkv-read-more = Read more about RWKV
+deck-config-rwkv-recommended = Recommended
+deck-config-rwkv-instant-subtitle = Review queue
+deck-config-rwkv-curve-subtitle = Answer intervals
+deck-config-rwkv-instant-description =
+    Instant replaces FSRS and Curve for review selection; scheduled due dates
+    are ignored.
+deck-config-rwkv-curve-description =
+    Curve replaces FSRS due dates with RWKV dates, useful for your next synced
+    mobile session. Instant ignores these dates.
 deck-config-rwkv-review-enabled = Use RWKV-Curve for answer intervals
 deck-config-rwkv-review-enabled-tooltip =
     On this computer, use RWKV-Curve to calculate the next intervals shown for
     Again, Hard, Good, and Easy. This does not enable RWKV-Instant review queue
-    ordering; that is controlled by the separate option below. Other devices
+    ordering; that is controlled separately. Other devices
     continue to use FSRS or SM-2.
-deck-config-rwkv-review-enforce-grade-order = Keep RWKV intervals in answer order
+deck-config-rwkv-review-enforce-grade-order = Enforce Again ≤ Hard ≤ Good ≤ Easy intervals
 deck-config-rwkv-review-enforce-grade-order-tooltip =
     Keep Again, Hard, Good, and Easy in a sensible interval order. When RWKV's
     four predictions disagree, Anki gently balances the conflicting predictions
     before choosing the intervals. Turn this off to use the raw RWKV-Curve
     results.
 deck-config-rwkv-review-instant-order = Use RWKV-Instant to choose review cards
-deck-config-rwkv-review-instant-order-recommended = Recommended: Use Ascending Retrievability
+deck-config-rwkv-review-instant-order-recommended = Recommended: Use Ascending Retrievability or Random
 deck-config-rwkv-review-instant-order-tooltip =
     RWKV decides which review cards are ready, and your selected review sort
     order determines how those cards are shown. A card may appear before its
@@ -374,11 +390,39 @@ deck-config-rwkv-review-refresh-on-exit-tooltip =
     If you answered at least one card, update the RWKV estimates in the
     background when you leave the reviewer. This helps prepare an up-to-date
     queue for your next review session.
+deck-config-scheduler-review = Review scheduler
+deck-config-scheduler-enable-fsrs = Machine Learning Based scheduling
+deck-config-scheduler-disabled = Machine learning scheduling is disabled for this collection. Selecting a model enables it; RWKV settings remain independent.
+deck-config-scheduler-due-dates = Fallback : Due-Date Calculator
+deck-config-scheduler-due-dates-description = Writes due dates for mobile sync and statistics. Instant selects reviews independently of these dates.
+deck-config-scheduler-recommended = Recommended: { $scheduler }
+deck-config-fsrs-description =
+    FSRS uses your review history to predict retrievability and schedule reviews
+    at your desired retention. FSRS-7 provides more accurate predictions than
+    FSRS-6 on average.
+deck-config-fsrs-read-more = Read more about FSRS
 deck-config-rwkv-review-allow-same-day-review = Allow a card to repeat on the same day
 deck-config-rwkv-review-allow-same-day-review-tooltip =
     When a card's estimated chance of recall is at or below your Desired
     Retention, RWKV may show it again later the same day. When this is off, a
     review card you answer will not appear again until the next day.
+# The variables become editable number fields that include their units.
+deck-config-rwkv-repeat-spacing = Minimum { $reviews-field } and { $seconds-field } between repeats
+deck-config-rwkv-repeat-spacing-title = Minimum spacing between repeats
+deck-config-rwkv-repeat-spacing-tooltip =
+    Before RWKV repeats a card, both minimums must be met: the number of other
+    reviews in the selected deck tree and the time since the card's last review.
+    Set either value to 0 to remove that minimum.
+deck-config-rwkv-repeat-reviews-unit =
+    { $count ->
+        [one] review
+       *[other] reviews
+    }
+deck-config-rwkv-repeat-seconds-unit =
+    { $count ->
+        [one] second
+       *[other] seconds
+    }
 deck-config-rwkv-review-min-intervening-reviews = Minimum other reviews before a repeat
 deck-config-rwkv-review-min-intervening-reviews-tooltip =
     How many other cards you must review before RWKV may repeat the same card. 0
@@ -391,8 +435,7 @@ deck-config-rwkv-review-first-review-elapsed-from-card-creation = Predict R for 
 deck-config-rwkv-review-first-review-elapsed-from-card-creation-tooltip =
     Use the time since a new card was created when predicting R before its first
     learning review. The first answer is recorded with elapsed time unknown, so
-    creation time does not affect later predictions. When this is off, RWKV also
-    treats elapsed time as unknown for the initial prediction.
+    creation time does not affect later predictions. This is always enabled.
 deck-config-rwkv-review-dynamic-preset-replay = Dynamic Preset Addon Support
 deck-config-rwkv-review-dynamic-preset-replay-tooltip =
     RWKV always resolves each card's current add-on preset once when rebuilding
@@ -588,8 +631,8 @@ deck-config-compute-optimal-weights-tooltip2 =
     optimizing the parameters.
 
 deck-config-please-save-your-changes-first = Please save your changes first.
-deck-config-workload-factor-change = Approximate workload: {$factor}x
-    (compared to {$previousDR}% desired retention)
+deck-config-workload-factor-change = Approximate workload: {$factor}x (vs initial DR: {$previousDR}%).
+deck-config-workload-factor-note = FSRS interval-based workload only.
 deck-config-workload-factor-unchanged = The higher your desired retention, the more frequently cards will be shown to you.
 deck-config-desired-retention-too-low = Your desired retention is very low, which can lead to very long intervals.
 deck-config-desired-retention-too-high = Your desired retention is very high, which can lead to very short intervals.

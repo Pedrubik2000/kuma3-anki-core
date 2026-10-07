@@ -43,6 +43,8 @@ Last reviewed: 2026-09-27.
   - [What happens when a card or preset moves?](#what-happens-when-a-card-or-preset-moves)
 - [4. Scheduling, limits, and workload](#4-scheduling-limits-and-workload)
   - [How does the fork handle daily review limits?](#how-does-the-fork-handle-daily-review-limits)
+  - [Can RWKV-Instant repeat a card when same-day reviews are disabled?](#can-rwkv-instant-repeat-a-card-when-same-day-reviews-are-disabled)
+  - [How do the same-day settings interact?](#how-do-the-same-day-settings-interact)
   - [Does RWKV override standard sibling burying?](#does-rwkv-override-standard-sibling-burying)
   - [Does RWKV guarantee fewer reviews than FSRS?](#does-rwkv-guarantee-fewer-reviews-than-fsrs)
 - [5. Calibration and prediction history](#5-calibration-and-prediction-history)
@@ -220,6 +222,21 @@ permanent deletion of review history.
 
 ## 4. Scheduling, limits, and workload
 
+### Where do I select the scheduler?
+
+In Deck Options, use **Scheduler → Review scheduler** to choose FSRS-6,
+FSRS-7, RWKV-Curve, or RWKV-Instant for the preset. Instant adds a separate
+**Fallback : Due-Date Calculator**: choose FSRS or Curve for stored due dates
+used by mobile sync and statistics. Instant ignores those dates when selecting
+reviews. The separate Curve and Instant enable switches have
+been replaced by these selectors. Older FSRS versions are no longer offered;
+existing saved choices are preserved until you explicitly select a current model.
+
+**Machine Learning Based scheduling** remains collection-wide. Choosing a model
+enables it; other presets keep their own model choices. Turning it off restores
+SM2 for native intervals, while the existing per-preset RWKV settings remain
+independent.
+
 ### How does the fork handle daily review limits?
 
 The fork still uses Anki's normal review limits and queue truncation. RWKV
@@ -234,11 +251,28 @@ simple cap.
 
 ### Can RWKV-Instant repeat a card when same-day reviews are disabled?
 
-With FSRS enabled, turning off **Allow same day review for (re)learning steps**
-prevents RWKV-Instant from showing a card already answered that scheduler day.
-This also applies when **Skip learning/relearning queues with FSRS/RWKV** is
-enabled. The RWKV same-day setting and repeat-spacing guards must also permit
-a repeat before it can appear.
+Turning off **Allow same day review for (re)learning steps** prevents
+RWKV-Instant from showing a card already answered that scheduler day, with or
+without FSRS. This also applies when **Skip learning/relearning queues with
+FSRS/RWKV** is enabled. With the switch on, both repeat-spacing minimums must
+still be met. The former RWKV-specific same-day switch has been removed; its
+saved value no longer blocks repeats.
+
+**Allow same day review for (re)learning steps** defaults to on. An explicitly
+saved off choice is preserved. It also controls generated short-term
+learning/relearning intervals for FSRS-7 and RWKV-Curve.
+With empty steps, or after the final configured step, turning it off schedules
+generated intervals as review states of at least one day. Configured steps still
+apply while learning/relearning queues are enabled; **Skip learning/relearning
+queues with FSRS/RWKV** bypasses those steps as well.
+
+If you want manual steps such as `1m 10m` for learning or `10m` for relearning to
+run, leave **Skip learning/relearning queues with FSRS/RWKV** off (its default).
+Turning it on with FSRS active bypasses these delays for new, learning, review,
+and relearning cards; answers schedule Review states directly. The configured
+step lists are kept. Turning it off makes them available again, but cards already
+graduated to Review are not automatically moved back into learning. With FSRS
+disabled, SM2 still follows its configured steps regardless of this bypass.
 
 Same-day Again answers do not add another lapse or trigger leech handling,
 regardless of queue skipping or scheduler. This also covers rescheduling filtered
@@ -246,6 +280,61 @@ decks and **Grade Now**. A review card's first answer of a scheduler day still
 adds a lapse when answered Again; later answers that day do not, even after an
 earlier successful answer. All answers remain in review history and update the
 model.
+
+### How do the same-day settings interact?
+
+FSRS-7 and RWKV-Curve decide answer intervals, while RWKV-Instant independently
+decides whether a review card can enter the queue. They share **Allow same day
+review for (re)learning steps**, which is shown when FSRS or Instant is enabled.
+The decision tree shows both paths. When Instant is enabled, its spacing
+minimums also apply to learning/relearning selection, including Learn ahead:
+
+```mermaid
+flowchart TD
+    A{"Scheduling path"}
+
+    A -->|FSRS-7 / RWKV-Curve| B{"Skip learning/relearning queues On?"}
+    B -->|Yes| C["Schedule directly as Review<br/>Minimum interval: 1 day"]
+    B -->|No| D{"Does a configured learning/relearning<br/>step apply to this answer?"}
+    D -->|Yes| E["Use the configured step delay"]
+    D -->|No| F{"Allow same day review for<br/>(re)learning steps On?"}
+    F -->|No| C
+    F -->|Yes| G{"Generated interval below 12 hours?"}
+    G -->|Yes| H["Use learning/relearning queue<br/>with the generated delay"]
+    G -->|No| C
+
+    E --> Q{"RWKV-Instant enabled?"}
+    H --> Q
+    Q -->|No| P
+    Q -->|Yes| L
+
+    A -->|RWKV-Instant| I{"Allow same day review for<br/>(re)learning steps On?"}
+    I -->|No| J["Same-day RWKV review repeat blocked"]
+    I -->|Yes| L{"Minimum other answers reached<br/>since this card's last answer?"}
+    L -->|No| M["Wait for enough other answers"]
+    L -->|Yes| N{"Minimum seconds elapsed<br/>since this card's last answer?"}
+    N -->|No| O["Wait for enough elapsed time"]
+    N -->|Yes| P["Card eligible for selection<br/>Other queue conditions still apply"]
+```
+
+The **Same-Day Repeats** row sets minimum other reviews and elapsed seconds
+between repeats. Both must be satisfied; a value of `0`
+removes that minimum. Their defaults are **5 other answers** and **30 seconds**.
+For example, values of **3** and **90** require both three other answers and
+90 elapsed seconds before the card can repeat while RWKV-Instant is enabled.
+This includes learning/relearning cards, even when a step is already due or
+Learn ahead would offer it early. Waiting preserves the card's saved interval
+and learning steps. Learning cards continue to follow those intervals; Instant's
+recall threshold is not added to their selection rules.
+
+**Allow same day review for (re)learning steps** defaults to on and is the sole
+same-day repeat switch for Instant. Its saved off choice is preserved; the
+former per-preset RWKV switch is ignored. The spacing guards and other queue
+conditions must still be satisfied.
+Configured learning/relearning steps may still repeat while queues are enabled.
+Enabling **Skip learning/relearning queues with FSRS/RWKV** bypasses these
+steps; RWKV-Instant can still admit an eligible same-day repeat even when the
+card's stored review due day is in the future.
 
 ### Does RWKV override standard sibling burying?
 

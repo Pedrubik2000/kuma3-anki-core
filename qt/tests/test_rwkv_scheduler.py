@@ -22,6 +22,7 @@ from typing import Any, cast
 
 import pytest
 
+import anki.collection  # Initialize collection before the cards/decks import cycle.
 from anki import cards_pb2, collection_pb2, scheduler_pb2
 from anki.decks import DeckId, FilteredDeckConfig
 from anki.scheduler.v3 import SchedulingState, SchedulingStates
@@ -105,6 +106,9 @@ def reset_rwkv_reviewer_backend() -> Iterator[None]:
     previous_warmup_generations = dict(
         rwkv_scheduler._reviewer_backend_warmup_generations
     )
+    previous_revalidation_candidates = dict(
+        rwkv_scheduler._reviewer_backend_revalidation_candidates
+    )
     previous_pending_generations = dict(
         rwkv_scheduler._reviewer_backend_warmup_pending_generations
     )
@@ -142,6 +146,7 @@ def reset_rwkv_reviewer_backend() -> Iterator[None]:
     previous_model_cache_signature = rwkv_scheduler._rwkv_model_cache_signature
     previous_model_cache_value = rwkv_scheduler._rwkv_model_cache_value
     rwkv_scheduler._reviewer_backend_warmup_states.clear()
+    rwkv_scheduler._reviewer_backend_revalidation_candidates.clear()
     rwkv_scheduler._reviewer_backend_assignment_generation = 0
     rwkv_scheduler._reviewer_backend_warmup_generations.clear()
     rwkv_scheduler._reviewer_backend_warmup_pending_generations.clear()
@@ -179,6 +184,10 @@ def reset_rwkv_reviewer_backend() -> Iterator[None]:
         )
         rwkv_scheduler._reviewer_backend_warmup_states.clear()
         rwkv_scheduler._reviewer_backend_warmup_states.update(previous_warmup_states)
+        rwkv_scheduler._reviewer_backend_revalidation_candidates.clear()
+        rwkv_scheduler._reviewer_backend_revalidation_candidates.update(
+            previous_revalidation_candidates
+        )
         rwkv_scheduler._reviewer_backend_warmup_generations.clear()
         rwkv_scheduler._reviewer_backend_warmup_generations.update(
             previous_warmup_generations
@@ -275,22 +284,37 @@ def test_queue_refresh_preserves_newer_invalidation() -> None:
     assert not rwkv_scheduler.reviewer_queue_order_refresh_required(reviewer)
 
 
-def test_rwkv_first_review_elapsed_source_reads_direct_and_nested_config() -> None:
-    assert rwkv_scheduler._rwkv_review_first_review_elapsed_from_card_creation(
-        {"rwkvReviewFirstReviewElapsedFromCardCreation": True}
-    )
-    assert rwkv_scheduler._rwkv_review_first_review_elapsed_from_card_creation(
+@pytest.mark.parametrize(
+    "config",
+    [
+        {},
+        {"rwkvReviewFirstReviewElapsedFromCardCreation": False},
         {
             "other": {
                 "jschoreels.rwkv": {
-                    "rwkv_review_first_review_elapsed_from_card_creation": True,
+                    "rwkv_review_first_review_elapsed_from_card_creation": False,
                 }
             }
-        }
-    )
-    assert rwkv_scheduler._rwkv_review_first_review_elapsed_from_card_creation({})
-    assert not rwkv_scheduler._rwkv_review_first_review_elapsed_from_card_creation(
-        {"rwkvReviewFirstReviewElapsedFromCardCreation": False}
+        },
+    ],
+)
+def test_rwkv_first_review_always_uses_creation_time(config: dict[str, object]) -> None:
+    assert rwkv_scheduler._rwkv_review_first_review_elapsed_from_card_creation(config)
+
+
+@pytest.mark.parametrize("setting", [None, False, True])
+@pytest.mark.parametrize("legacy_enabled", [False, True])
+def test_rwkv_global_dynamic_preset_replay_overrides_legacy_setting(
+    setting: bool | None, legacy_enabled: bool
+) -> None:
+    reviewer = _rwkv_reviewer(rwkv_review_dynamic_preset_replay=legacy_enabled)
+    reviewer.mw.col.get_config = lambda key: setting
+
+    state = rwkv_scheduler._rwkv_collection_config_state(reviewer)
+
+    assert state.review_enabled
+    assert state.dynamic_preset_replay_enabled == (
+        legacy_enabled if setting is None else setting
     )
 
 
@@ -463,9 +487,8 @@ def test_study_queue_change_invalidates_cached_and_async_rwkv_work() -> None:
     set_reviewer_backend(resident_backend)
     warmup_key = rwkv_scheduler._reviewer_backend_warmup_key(reviewer)
     assert warmup_key is not None
-    rwkv_scheduler._reviewer_backend_warmup_states[warmup_key] = (
-        _rwkv_resident_identity()
-    )
+    resident_identity = _rwkv_resident_identity()
+    rwkv_scheduler._reviewer_backend_warmup_states[warmup_key] = resident_identity
     context = rwkv_scheduler._rwkv_review_queue_context(reviewer, 100)
     cache_key = rwkv_scheduler._rwkv_review_input_batch_cache_key(
         reviewer=reviewer,
@@ -519,6 +542,10 @@ def test_study_queue_change_invalidates_cached_and_async_rwkv_work() -> None:
     assert rwkv_scheduler._rwkv_score_prewarm_in_flight == set()
     assert warmup_key not in rwkv_scheduler._reviewer_backend_warmup_states
     assert rwkv_scheduler._reviewer_backend_warmup_generations[warmup_key] == 1
+    assert rwkv_scheduler._reviewer_backend_revalidation_candidates[warmup_key] == (
+        1,
+        resident_identity,
+    )
     assert rpc.calls[-1] == {"deck_id": 100, "scores": []}
     assert rpc.deck_count_clears == 1
     assert not rwkv_scheduler.install_reviewer_queue_order_async_result(
@@ -631,6 +658,497 @@ def test_preset_resolution_change_invalidates_resident_rwkv_state() -> None:
     assert warmup_key not in rwkv_scheduler._reviewer_backend_warmup_states
     assert warmup_key not in rwkv_scheduler._rwkv_memorised_history_identity_cache
     assert rwkv_scheduler._reviewer_backend_warmup_generations[warmup_key] == 1
+    assert rwkv_scheduler._reviewer_backend_revalidation_candidates[warmup_key] == (
+        1,
+        resident_identity,
+    )
+
+
+@pytest.mark.parametrize("known_identity", [False, True])
+@pytest.mark.parametrize("keep_candidate", [False, True])
+def test_invalidation_only_retains_known_resident_identity(
+    known_identity: bool, keep_candidate: bool
+) -> None:
+    set_reviewer_backend(RwkvStatefulReviewerBackend(_CacheRuntime()))
+    reviewer = _rwkv_reviewer()
+    reviewer.mw.col.db = SimpleNamespace()
+    key = rwkv_scheduler._reviewer_backend_warmup_key(reviewer)
+    assert key is not None
+    identity = _rwkv_resident_identity()
+    rwkv_scheduler._reviewer_backend_warmup_states[key] = (
+        identity if known_identity else None
+    )
+    rwkv_scheduler._reviewer_backend_revalidation_candidates[key] = (0, identity)
+
+    rwkv_scheduler._invalidate_reviewer_backend_state(
+        reviewer, reason="test mutation", keep_revalidation_candidate=keep_candidate
+    )
+
+    if known_identity and keep_candidate:
+        assert rwkv_scheduler._reviewer_backend_revalidation_candidates[key] == (
+            1,
+            identity,
+        )
+    else:
+        assert key not in rwkv_scheduler._reviewer_backend_revalidation_candidates
+
+
+@pytest.fixture
+def resident_revalidation(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    backend = RwkvStatefulReviewerBackend(_CacheRuntime())
+    set_reviewer_backend(backend)
+    reviewer = _rwkv_reviewer()
+    reviewer.mw.col.db = SimpleNamespace()
+    key = rwkv_scheduler._reviewer_backend_warmup_key(reviewer)
+    assert key is not None
+    identity = _rwkv_resident_identity()
+    assert rwkv_scheduler._publish_reviewer_backend_state(
+        key, identity, expected_generation=0
+    )
+    rwkv_scheduler.study_queues_did_change(reviewer.mw, None)
+    metadata = {
+        "lastReviewId": identity.last_review_id,
+        "reviewCount": identity.review_count,
+        "historyHash": identity.history_hash,
+        "replayKey": identity.replay_key,
+        "ignoredReviewIds": [100],
+    }
+    fingerprint_identity = rwkv_scheduler._RwkvHistoryPrefixIdentity(
+        identity.last_review_id, identity.review_count, identity.history_hash
+    )
+    state = SimpleNamespace(
+        backend=backend,
+        reviewer=reviewer,
+        key=key,
+        identity=identity,
+        metadata=metadata,
+        replay_key=identity.replay_key,
+        compatible=True,
+        cutoffs={},
+        fingerprint=rwkv_scheduler._RwkvHistoricalReviewFingerprint(
+            fingerprint_identity, (100,), 2, True
+        ),
+        refreshed_markers=[],
+    )
+
+    def compatible(
+        _reviewer: object, _metadata: object, *, dynamic_preset_replay_enabled: object
+    ) -> bool:
+        assert dynamic_preset_replay_enabled is None
+        return state.compatible
+
+    def fingerprint(
+        _reviewer: object, *, ignored_review_ids: object, expected_identity: object
+    ) -> object:
+        assert ignored_review_ids == (100,)
+        assert expected_identity == fingerprint_identity
+        return state.fingerprint
+
+    def replay_key(_reviewer: object, *, first_review_elapsed_source: object) -> str:
+        assert (
+            first_review_elapsed_source
+            == rwkv_scheduler.RwkvFirstReviewElapsedSource.DECK_CONFIG
+        )
+        return state.replay_key
+
+    monkeypatch.setattr(
+        rwkv_scheduler,
+        "_read_rwkv_state_cache_metadata",
+        lambda _reviewer: state.metadata,
+    )
+    monkeypatch.setattr(
+        rwkv_scheduler, "_rwkv_state_cache_metadata_compatible", compatible
+    )
+    monkeypatch.setattr(
+        rwkv_scheduler,
+        "_rwkv_preserved_learning_start_cutoffs",
+        lambda _reviewer: state.cutoffs,
+    )
+    monkeypatch.setattr(rwkv_scheduler, "_rwkv_replay_semantics_key", replay_key)
+    monkeypatch.setattr(
+        rwkv_scheduler, "_rwkv_historical_review_fingerprint", fingerprint
+    )
+    monkeypatch.setattr(
+        rwkv_scheduler,
+        "_refresh_rwkv_state_cache_collection_mod",
+        lambda _reviewer, identity: state.refreshed_markers.append(identity),
+    )
+    monkeypatch.setattr(
+        rwkv_scheduler,
+        "_restore_reviewer_backend_cache",
+        lambda *_args, **_kwargs: pytest.fail("unexpected state cache restore"),
+    )
+    monkeypatch.setattr(
+        rwkv_scheduler,
+        "_read_rwkv_state_cache",
+        lambda *_args, **_kwargs: pytest.fail("unexpected state store read"),
+    )
+    return state
+
+
+@pytest.mark.parametrize("revalidate_only", [False, True])
+def test_warmup_reuses_exact_resident_state_after_repeated_invalidations(
+    resident_revalidation: SimpleNamespace, revalidate_only: bool
+) -> None:
+    state = resident_revalidation
+    rwkv_scheduler.fsrs_preset_resolution_did_change(state.reviewer.mw)
+    rwkv_scheduler.study_queues_did_change(state.reviewer.mw, None)
+    assert rwkv_scheduler._reviewer_backend_revalidation_candidates[state.key] == (
+        3,
+        state.identity,
+    )
+
+    assert rwkv_scheduler._warm_up_reviewer_backend(
+        state.reviewer, revalidate_only=revalidate_only
+    )
+
+    assert rwkv_scheduler._reviewer_backend_warmup_states[state.key] == state.identity
+    assert state.key not in rwkv_scheduler._reviewer_backend_revalidation_candidates
+    assert state.key not in rwkv_scheduler._reviewer_backend_warmup_pending_generations
+    assert state.refreshed_markers == [state.identity]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "fingerprint-invalid",
+        "prefix-only",
+        "fingerprint-identity",
+        "fingerprint-missing",
+        "exception",
+        "replay-key",
+        "lastReviewId",
+        "reviewCount",
+        "historyHash",
+        "replayKey",
+        "metadata-missing",
+        "metadata-incompatible",
+        "learning-cutoffs",
+        "generation",
+        "invalidation",
+        "unknown-identity",
+    ],
+)
+@pytest.mark.parametrize("revalidate_only", [False, True])
+def test_warmup_rejects_changed_resident_state(
+    resident_revalidation: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    revalidate_only: bool,
+) -> None:
+    state = resident_revalidation
+    if failure in ("fingerprint-invalid", "prefix-only"):
+        state.fingerprint = state.fingerprint._replace(
+            history_is_valid=False, history_prefix_is_valid=failure == "prefix-only"
+        )
+    elif failure == "fingerprint-identity":
+        state.fingerprint = state.fingerprint._replace(
+            identity=state.fingerprint.identity._replace(review_count=3)
+        )
+    elif failure == "fingerprint-missing":
+        state.fingerprint = None
+    elif failure == "exception":
+
+        def fingerprint(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("fingerprint unavailable")
+
+        monkeypatch.setattr(
+            rwkv_scheduler, "_rwkv_historical_review_fingerprint", fingerprint
+        )
+    elif failure == "replay-key":
+        state.replay_key = "changed-replay"
+    elif failure in ("lastReviewId", "reviewCount", "historyHash", "replayKey"):
+        state.metadata[failure] = "changed"
+    elif failure == "metadata-missing":
+        state.metadata = {}
+    elif failure == "metadata-incompatible":
+        state.compatible = False
+    elif failure == "learning-cutoffs":
+        state.cutoffs = {1: 100}
+    elif failure == "generation":
+        rwkv_scheduler._reviewer_backend_warmup_generations[state.key] += 1
+    elif failure == "invalidation":
+        rwkv_scheduler._invalidate_reviewer_backend_state(
+            state.reviewer, reason="new mutation"
+        )
+    else:
+        rwkv_scheduler._mark_reviewer_backend_identity_unknown(
+            state.reviewer, reason="answer"
+        )
+    restored_identity = replace(state.identity, review_count=3)
+    restores: list[object] = []
+
+    def restore(
+        _reviewer: object, **_kwargs: object
+    ) -> rwkv_scheduler.RwkvResidentStateIdentity:
+        assert state.key not in rwkv_scheduler._reviewer_backend_revalidation_candidates
+        restores.append(_reviewer)
+        return restored_identity
+
+    monkeypatch.setattr(rwkv_scheduler, "_restore_reviewer_backend_cache", restore)
+    assert rwkv_scheduler._warm_up_reviewer_backend(
+        state.reviewer, revalidate_only=revalidate_only
+    ) is (not revalidate_only)
+    assert state.key not in rwkv_scheduler._reviewer_backend_revalidation_candidates
+    assert restores == ([] if revalidate_only else [state.reviewer])
+    assert rwkv_scheduler._reviewer_backend_warmup_states.get(state.key) == (
+        None if revalidate_only else restored_identity
+    )
+    assert state.key not in rwkv_scheduler._reviewer_backend_warmup_pending_generations
+
+
+def test_warmup_does_not_publish_candidate_invalidated_during_fingerprint(
+    resident_revalidation: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = resident_revalidation
+
+    def fingerprint(*_args: object, **_kwargs: object) -> object:
+        rwkv_scheduler._invalidate_reviewer_backend_state(
+            state.reviewer, reason="concurrent mutation"
+        )
+        return state.fingerprint
+
+    monkeypatch.setattr(
+        rwkv_scheduler, "_rwkv_historical_review_fingerprint", fingerprint
+    )
+    assert not rwkv_scheduler._warm_up_reviewer_backend(
+        state.reviewer, revalidate_only=True
+    )
+    assert state.key not in rwkv_scheduler._reviewer_backend_warmup_states
+    assert state.key not in rwkv_scheduler._reviewer_backend_revalidation_candidates
+
+
+def test_stale_revalidation_keeps_candidate_rearmed_by_newer_reset(
+    resident_revalidation: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = resident_revalidation
+    fingerprints: list[object] = []
+
+    def fingerprint(*_args: object, **_kwargs: object) -> object:
+        if not fingerprints:
+            rwkv_scheduler.study_queues_did_change(state.reviewer.mw, None)
+        fingerprints.append(state.fingerprint)
+        return state.fingerprint
+
+    monkeypatch.setattr(
+        rwkv_scheduler, "_rwkv_historical_review_fingerprint", fingerprint
+    )
+    assert not rwkv_scheduler._warm_up_reviewer_backend(
+        state.reviewer, revalidate_only=True
+    )
+    assert state.key in rwkv_scheduler._reviewer_backend_revalidation_candidates
+
+    assert rwkv_scheduler._warm_up_reviewer_backend(
+        state.reviewer, revalidate_only=True
+    )
+    assert rwkv_scheduler._reviewer_backend_warmup_states[state.key] == state.identity
+    assert len(fingerprints) == 2
+
+
+@pytest.mark.parametrize(
+    "action", ["invalidate-all", "unknown-all", "profile-open", "backend-replaced"]
+)
+def test_backend_bookkeeping_drops_revalidation_candidates(
+    resident_revalidation: SimpleNamespace, action: str
+) -> None:
+    state = resident_revalidation
+    if action == "invalidate-all":
+        rwkv_scheduler._invalidate_reviewer_backend_states(
+            state.backend, reason="mutation"
+        )
+    elif action == "unknown-all":
+        rwkv_scheduler._mark_reviewer_backend_identities_unknown(
+            state.backend, reason="answer"
+        )
+    elif action == "profile-open":
+        rwkv_scheduler._invalidate_reviewer_backend_runtime_state_for_profile_open()
+    else:
+        set_reviewer_backend(state.backend)
+    assert rwkv_scheduler._reviewer_backend_revalidation_candidates == {}
+
+
+@pytest.mark.parametrize("restore_fails", [False, True])
+def test_temporary_replay_retains_candidate_only_when_original_state_restored(
+    resident_revalidation: SimpleNamespace, restore_fails: bool
+) -> None:
+    state = resident_revalidation
+    original = state.backend.cache_snapshot()
+
+    def restore(snapshot: RwkvBackendCacheSnapshot) -> None:
+        if restore_fails:
+            raise RuntimeError("restore failed")
+        state.backend.restore_cache_snapshot(snapshot)
+
+    def replay() -> None:
+        with rwkv_scheduler._temporary_reviewer_backend_operation(
+            state.reviewer,
+            state.backend,
+            cache_snapshot=state.backend.cache_snapshot,
+            restore_cache_snapshot=restore,
+        ) as operation:
+            assert operation is not None
+            state.backend.reset_cache_snapshot()
+
+    if restore_fails:
+        with pytest.raises(RuntimeError, match="restore failed"):
+            replay()
+        assert state.key not in rwkv_scheduler._reviewer_backend_revalidation_candidates
+    else:
+        replay()
+        assert state.backend.cache_snapshot() == original
+        assert rwkv_scheduler._reviewer_backend_revalidation_candidates[state.key] == (
+            1,
+            state.identity,
+        )
+
+
+@pytest.mark.parametrize("view", ["deckBrowser", "review"])
+def test_legacy_reset_revalidation_coalesces_and_refreshes_after_success(
+    resident_revalidation: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, view: str
+) -> None:
+    state = resident_revalidation
+    mw = state.reviewer.mw
+    mw.state = view
+    scheduled: list[Callable[[], None]] = []
+    tasks: list[tuple[Callable[[], bool], Callable[[Future[bool]], None]]] = []
+    calls: list[str] = []
+
+    def single_shot(
+        ms: int, callback: Callable[[], None], *, requires_collection: bool
+    ) -> None:
+        assert ms == 500
+        assert not requires_collection
+        scheduled.append(callback)
+
+    def run_in_background(
+        task: Callable[[], bool],
+        done: Callable[[Future[bool]], None],
+        *,
+        uses_collection: bool,
+    ) -> None:
+        assert uses_collection
+        tasks.append((task, done))
+
+    def refresh_review(
+        changes: collection_pb2.OpChanges, initiator: object, *, focused: bool
+    ) -> None:
+        assert changes.study_queues and initiator is None and focused
+        calls.append("review")
+
+    mw.progress = SimpleNamespace(single_shot=single_shot)
+    mw.taskman = SimpleNamespace(run_in_background=run_in_background)
+    mw.onRefreshTimer = lambda: calls.append("counts")
+    mw.reviewer = SimpleNamespace(op_executed=refresh_review)
+    from aqt import gui_hooks
+
+    monkeypatch.setattr(
+        gui_hooks, "rwkv_state_did_prepare", lambda window: calls.append("prepared")
+    )
+    for _ in range(3):
+        rwkv_scheduler.revalidate_rwkv_state_after_legacy_reset(mw)
+    assert len(scheduled) == 1
+    assert not getattr(mw, "_rwkv_state_cache_loading", False)
+    scheduled[0]()
+    assert len(tasks) == 1
+    rwkv_scheduler.revalidate_rwkv_state_after_legacy_reset(mw)
+    assert len(scheduled) == 1
+    task, done = tasks[0]
+    future: Future[bool] = Future()
+    future.set_result(task())
+    assert calls == []
+    done(future)
+
+    assert calls == (
+        ["counts", "prepared"] if view == "deckBrowser" else ["prepared", "review"]
+    )
+    assert not mw._rwkv_legacy_reset_revalidation_scheduled
+    assert not getattr(mw, "_rwkv_state_cache_loading", False)
+    assert rwkv_scheduler._reviewer_backend_warmup_states[state.key] == state.identity
+
+
+@pytest.mark.parametrize(
+    "condition",
+    ["no-candidate", "disabled", "loading", "no-backend", "collection-changed"],
+)
+@pytest.mark.parametrize("after_scheduling", [False, True])
+def test_legacy_reset_revalidation_skips_when_preconditions_change(
+    resident_revalidation: SimpleNamespace,
+    condition: str,
+    after_scheduling: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = resident_revalidation
+    mw = state.reviewer.mw
+    scheduled: list[Callable[[], None]] = []
+    mw.progress = SimpleNamespace(
+        single_shot=lambda _ms, callback, **_kwargs: scheduled.append(callback)
+    )
+    mw.taskman = SimpleNamespace(
+        run_in_background=lambda *_args, **_kwargs: pytest.fail(
+            "unexpected background task"
+        )
+    )
+    if after_scheduling:
+        rwkv_scheduler.revalidate_rwkv_state_after_legacy_reset(mw)
+        assert len(scheduled) == 1
+    if condition == "no-candidate":
+        rwkv_scheduler._reviewer_backend_revalidation_candidates.clear()
+    elif condition == "disabled":
+        monkeypatch.setattr(
+            rwkv_scheduler,
+            "_rwkv_collection_config_state",
+            lambda _reviewer: rwkv_scheduler._RwkvCollectionConfigState(False, False),
+        )
+    elif condition == "loading":
+        mw._rwkv_state_cache_loading = True
+    elif condition == "no-backend":
+        set_reviewer_backend(None)
+    else:
+        mw.col = SimpleNamespace(db=SimpleNamespace())
+    if after_scheduling:
+        scheduled[0]()
+        assert not mw._rwkv_legacy_reset_revalidation_scheduled
+    else:
+        rwkv_scheduler.revalidate_rwkv_state_after_legacy_reset(mw)
+        assert scheduled == []
+
+
+def test_legacy_reset_revalidation_failure_leaves_normal_recovery_available(
+    resident_revalidation: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = resident_revalidation
+    state.fingerprint = None
+    mw = state.reviewer.mw
+    mw.state = "overview"
+    scheduled: list[Callable[[], None]] = []
+    mw.progress = SimpleNamespace(
+        single_shot=lambda _ms, callback, **_kwargs: scheduled.append(callback)
+    )
+    mw.onRefreshTimer = lambda: pytest.fail("unexpected refresh")
+
+    def run_in_background(
+        task: Callable[[], bool],
+        done: Callable[[Future[bool]], None],
+        *,
+        uses_collection: bool,
+    ) -> None:
+        future: Future[bool] = Future()
+        future.set_result(task())
+        done(future)
+
+    mw.taskman = SimpleNamespace(run_in_background=run_in_background)
+    from aqt import gui_hooks
+
+    monkeypatch.setattr(
+        gui_hooks,
+        "rwkv_state_did_prepare",
+        lambda _mw: pytest.fail("unexpected prepare notification"),
+    )
+    rwkv_scheduler.revalidate_rwkv_state_after_legacy_reset(mw)
+    scheduled[0]()
+    assert not mw._rwkv_legacy_reset_revalidation_scheduled
+    assert not rwkv_scheduler.rwkv_state_cache_loading(mw)
+    assert state.key not in rwkv_scheduler._reviewer_backend_warmup_states
 
 
 @pytest.mark.parametrize(
@@ -686,6 +1204,234 @@ def test_editor_change_keeps_resident_state_for_undo_restored_card(
     assert rwkv_scheduler._reviewer_backend_warmup_generations.get(warmup_key, 0) == 0
     assert rwkv_scheduler._resolved_preset_id_cache[cache_key] == {1: "1000"}
     assert rwkv_scheduler._dynamic_desired_retention_generation == 1
+
+
+def test_successive_editor_changes_keep_reconciled_resident_state() -> None:
+    backend = RwkvStatefulReviewerBackend(_CacheRuntime())
+    set_reviewer_backend(backend)
+    reviewer = _rwkv_reviewer()
+    reviewer.mw.reviewer = reviewer
+    reviewer.mw.col.get_config = lambda _key: {
+        "rules": [{"search": "Front:foo", "preset_id": "1000"}]
+    }
+
+    class DB:
+        def list(self, sql: str, *args: object) -> list[int]:
+            if "from cards" in sql:
+                assert args == (10,)
+                return [1]
+            assert "from revlog" in sql
+            assert args == ()
+            return [1]
+
+    reviewer.mw.col.db = DB()
+    warmup_key = rwkv_scheduler._reviewer_backend_warmup_key(reviewer)
+    assert warmup_key is not None
+    resident_identity = _rwkv_resident_identity()
+    rwkv_scheduler._reviewer_backend_warmup_states[warmup_key] = resident_identity
+    warmup_generation = rwkv_scheduler._reviewer_backend_warmup_generations.get(
+        warmup_key, 0
+    )
+    cache_key = rwkv_scheduler._preset_id_cache_key(reviewer)
+    rwkv_scheduler._resolved_preset_id_cache[cache_key] = {1: "1000"}
+    editor_initiator = SimpleNamespace(nid=10, card=SimpleNamespace(id=1))
+
+    rwkv_scheduler._mark_collection_change_reconciled(reviewer, card_ids=(1,))
+    rwkv_scheduler.collection_content_did_change(reviewer.mw, editor_initiator)
+    rwkv_scheduler.collection_content_did_change(reviewer.mw, editor_initiator)
+
+    assert rwkv_scheduler._reviewer_backend_warmup_states[warmup_key] == (
+        resident_identity
+    )
+    assert (
+        rwkv_scheduler._reviewer_backend_warmup_generations.get(warmup_key, 0)
+        == warmup_generation
+    )
+    assert rwkv_scheduler._resolved_preset_id_cache[cache_key] == {1: "1000"}
+
+
+@pytest.mark.parametrize("current_mod", [2, 3], ids=["latest-save", "stale-markers"])
+def test_queued_editor_changes_check_latest_save_mod(
+    current_mod: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = RwkvStatefulReviewerBackend(_CacheRuntime())
+    set_reviewer_backend(backend)
+    reviewer = _rwkv_reviewer()
+    reviewer.mw.reviewer = reviewer
+    reviewer.mw.col.get_config = lambda _key: {
+        "rules": [{"search": "Front:foo", "preset_id": "1000"}]
+    }
+
+    class DB:
+        def list(self, sql: str, *args: object) -> list[int]:
+            if "from cards" in sql:
+                assert args == (10,)
+                return [1]
+            assert "from revlog" in sql
+            assert args == ()
+            return [1]
+
+    reviewer.mw.col.db = DB()
+    warmup_key = rwkv_scheduler._reviewer_backend_warmup_key(reviewer)
+    assert warmup_key is not None
+    resident_identity = _rwkv_resident_identity()
+    rwkv_scheduler._reviewer_backend_warmup_states[warmup_key] = resident_identity
+    warmup_generation = rwkv_scheduler._reviewer_backend_warmup_generations.get(
+        warmup_key, 0
+    )
+    cache_key = rwkv_scheduler._preset_id_cache_key(reviewer)
+    rwkv_scheduler._resolved_preset_id_cache[cache_key] = {1: "1000"}
+    editor_initiator = SimpleNamespace(nid=10, card=SimpleNamespace(id=1))
+
+    collection_mod = [1]
+    monkeypatch.setattr(
+        rwkv_scheduler, "_rwkv_collection_modified", lambda _reviewer: collection_mod[0]
+    )
+    routing_checks: list[tuple[int, ...]] = []
+
+    def check_routing(_reviewer: object, card_ids: Sequence[int]) -> bool:
+        if current_mod == 2:
+            pytest.fail("queued editor save took the unmarked path")
+        routing_checks.append(tuple(card_ids))
+        return True
+
+    monkeypatch.setattr(
+        rwkv_scheduler, "_changed_cards_keep_rwkv_preset_routing", check_routing
+    )
+    rwkv_scheduler._mark_collection_change_reconciled(reviewer, card_ids=(1,))
+    collection_mod[0] = 2
+    rwkv_scheduler._mark_collection_change_reconciled(reviewer, card_ids=(1,))
+    collection_mod[0] = current_mod
+    rwkv_scheduler.collection_content_did_change(reviewer.mw, editor_initiator)
+    if current_mod == 2:
+        rwkv_scheduler.collection_content_did_change(reviewer.mw, editor_initiator)
+    assert routing_checks == ([] if current_mod == 2 else [(1,)])
+    for target in (reviewer, reviewer.mw):
+        assert not getattr(
+            target, rwkv_scheduler._RWKV_GRADE_NOW_RECONCILED_QUEUE_CHANGE_PENDING_ATTR
+        )
+    assert rwkv_scheduler._reviewer_backend_warmup_states[warmup_key] == (
+        resident_identity
+    )
+    assert (
+        rwkv_scheduler._reviewer_backend_warmup_generations.get(warmup_key, 0)
+        == warmup_generation
+    )
+    assert rwkv_scheduler._resolved_preset_id_cache[cache_key] == {1: "1000"}
+
+
+def test_editor_change_keeps_resident_state_during_preset_refresh() -> None:
+    backend = RwkvStatefulReviewerBackend(_CacheRuntime())
+    set_reviewer_backend(backend)
+    reviewer = _rwkv_reviewer()
+    reviewer.mw.reviewer = reviewer
+    reviewer.mw.col.get_config = lambda _key: {
+        "rules": [{"search": "Front:foo", "preset_id": "1000"}]
+    }
+
+    class DB:
+        def list(self, sql: str, *args: object) -> list[int]:
+            if "from cards" in sql:
+                assert args == (10,)
+                return [1]
+            assert "from revlog" in sql
+            assert args == ()
+            return [1]
+
+    reviewer.mw.col.db = DB()
+    warmup_key = rwkv_scheduler._reviewer_backend_warmup_key(reviewer)
+    assert warmup_key is not None
+    resident_identity = _rwkv_resident_identity()
+    rwkv_scheduler._reviewer_backend_warmup_states[warmup_key] = resident_identity
+    warmup_generation = rwkv_scheduler._reviewer_backend_warmup_generations.get(
+        warmup_key, 0
+    )
+    cache_key = rwkv_scheduler._preset_id_cache_key(reviewer)
+    rwkv_scheduler._resolved_preset_id_cache[cache_key] = {1: "1000"}
+    editor_initiator = SimpleNamespace(nid=10, card=SimpleNamespace(id=1))
+
+    backend_calls: list[tuple[int, ...]] = []
+
+    def get_preset_ids(card_ids: Sequence[int]) -> list[SimpleNamespace]:
+        backend_calls.append(tuple(card_ids))
+        if len(backend_calls) == 1:
+            rwkv_scheduler.collection_content_did_change(reviewer.mw, editor_initiator)
+        return [SimpleNamespace(card_id=1, preset_id="1000")]
+
+    reviewer.mw.col._backend = SimpleNamespace(
+        get_fsrs_preset_ids_for_cards=get_preset_ids
+    )
+    rwkv_scheduler.collection_content_did_change(reviewer.mw, editor_initiator)
+
+    assert backend_calls == [(1,), (1,)]
+    assert rwkv_scheduler._reviewer_backend_warmup_states[warmup_key] == (
+        resident_identity
+    )
+    assert (
+        rwkv_scheduler._reviewer_backend_warmup_generations.get(warmup_key, 0)
+        == warmup_generation
+    )
+    assert rwkv_scheduler._resolved_preset_id_cache[cache_key] == {1: "1000"}
+
+
+def test_reconciled_editor_markers_are_bounded_and_consumed_oldest_first() -> None:
+    reviewer = _rwkv_reviewer()
+    active_reviewer = SimpleNamespace(mw=reviewer.mw)
+    reviewer.mw.reviewer = active_reviewer
+    for card_id in range(1, 66):
+        rwkv_scheduler._mark_collection_change_reconciled(reviewer, card_ids=(card_id,))
+
+    for card_id in range(2, 66):
+        change = rwkv_scheduler._take_reconciled_collection_change(reviewer)
+        assert change is not None
+        assert change.card_ids == (card_id,)
+        attr = rwkv_scheduler._RWKV_RECONCILED_COLLECTION_CHANGE_PENDING_ATTR
+        assert getattr(reviewer, attr) == getattr(reviewer.mw, attr)
+        assert getattr(active_reviewer, attr) == getattr(reviewer.mw, attr)
+    assert not getattr(reviewer, attr)
+
+
+@pytest.mark.parametrize("batch", [False, True], ids=["per-card", "batch"])
+def test_preset_refresh_replaces_cached_ids_and_removes_unresolved_cards(
+    batch: bool,
+) -> None:
+    reviewer = _rwkv_reviewer()
+    cache_key = rwkv_scheduler._preset_id_cache_key(reviewer)
+    cache = {1: "1000", 2: "1000", 3: "1000"}
+    rwkv_scheduler._resolved_preset_id_cache[cache_key] = cache
+    reviewer.mw.col.fsrs_preset_for_card = lambda card_id: SimpleNamespace(
+        id="2000" if card_id == 1 else None
+    )
+    if batch:
+        reviewer.mw.col._backend = SimpleNamespace(
+            get_fsrs_preset_ids_for_cards=lambda card_ids: [
+                SimpleNamespace(card_id=1, preset_id="2000")
+            ]
+        )
+
+    assert rwkv_scheduler._refresh_resolved_fsrs_preset_ids(reviewer, (1, 2)) == {
+        1: "2000"
+    }
+    assert cache == {1: "2000", 3: "1000"}
+
+
+def test_unscoped_reconciled_content_change_clears_entire_preset_cache() -> None:
+    backend = RwkvStatefulReviewerBackend(_CacheRuntime())
+    set_reviewer_backend(backend)
+    reviewer = _rwkv_reviewer()
+    reviewer.mw.reviewer = reviewer
+    cache_key = rwkv_scheduler._preset_id_cache_key(reviewer)
+    rwkv_scheduler._resolved_preset_id_cache[cache_key] = {
+        1: "1000",
+        2: "1000",
+    }
+
+    rwkv_scheduler._mark_collection_change_reconciled(reviewer)
+    rwkv_scheduler.collection_content_did_change(
+        reviewer.mw, SimpleNamespace(nid=10, card=SimpleNamespace(id=1))
+    )
+
+    assert rwkv_scheduler._resolved_preset_id_cache[cache_key] == {}
 
 
 def test_collection_content_change_invalidates_state_when_preset_changes() -> None:
@@ -4770,7 +5516,7 @@ def test_rwkv_later_learning_answer_preserves_elapsed_time() -> None:
     assert rwkv_scheduler._rwkv_state_update_input(answer) is answer
 
 
-def test_rwkv_review_input_leaves_new_card_elapsed_missing_by_default() -> None:
+def test_rwkv_review_input_uses_creation_time_with_legacy_flag_off() -> None:
     reviewer = _rwkv_reviewer()
     reviewer._v3.states.current.normal.new.SetInParent()
     card = _rwkv_card(
@@ -4794,8 +5540,8 @@ def test_rwkv_review_input_leaves_new_card_elapsed_missing_by_default() -> None:
     )
 
     assert review_input.current_normal_state_kind == "new"
-    assert review_input.current_elapsed_days is None
-    assert review_input.current_elapsed_seconds is None
+    assert review_input.current_elapsed_days == 1
+    assert review_input.current_elapsed_seconds == 90_000
 
 
 def test_rwkv_stats_graph_review_input_uses_exact_elapsed_seconds(
@@ -4866,7 +5612,7 @@ def test_rwkv_stats_graph_review_input_uses_card_creation_elapsed_by_default() -
     assert review_input.current_elapsed_seconds == 90_000
 
 
-def test_rwkv_stats_graph_new_card_creation_elapsed_can_be_disabled() -> None:
+def test_rwkv_stats_graph_uses_creation_time_with_legacy_flag_off() -> None:
     now = 42 * 86_400 + 100
     card = rwkv_scheduler.RwkvStatsGraphCard(
         id=(now - 90_000) * 1000,
@@ -4901,8 +5647,8 @@ def test_rwkv_stats_graph_new_card_creation_elapsed_can_be_disabled() -> None:
     assert review_input is not None
     assert review_input.current_state_kind == "normal"
     assert review_input.current_normal_state_kind == "new"
-    assert review_input.current_elapsed_days is None
-    assert review_input.current_elapsed_seconds is None
+    assert review_input.current_elapsed_days == 1
+    assert review_input.current_elapsed_seconds == 90_000
 
 
 def test_record_reviewer_answer_does_not_write_card_s90_separately() -> None:
@@ -5787,7 +6533,10 @@ def test_historical_rwkv_inputs_can_use_card_creation_for_first_review_elapsed()
         ],
     )
 
-    missing = rwkv_scheduler._historical_rwkv_review_inputs(reviewer)
+    missing = rwkv_scheduler._historical_rwkv_review_inputs(
+        reviewer,
+        first_review_elapsed_source=rwkv_scheduler.RwkvFirstReviewElapsedSource.MISSING,
+    )
     card_creation = rwkv_scheduler._historical_rwkv_review_inputs(
         reviewer,
         first_review_elapsed_source=rwkv_scheduler.RwkvFirstReviewElapsedSource.CARD_CREATION,
@@ -7836,7 +8585,7 @@ def test_rwkv_historical_fingerprint_passes_stable_addon_preset_ids(
                     "addon:simulator",
                 )
             },
-            "first_review_uses_creation_by_config_id": {123: False, 456: True},
+            "first_review_uses_creation_by_config_id": {123: True, 456: True},
             "expected_identity": scheduler_pb2.RwkvHistoricalReviewIdentity(
                 last_review_id=2_000,
                 review_count=2,
@@ -8193,9 +8942,7 @@ def test_reviewer_rwkv_cache_rebuilds_when_replay_semantics_change(
 ) -> None:
     first_review = (40 * 86_400 + 100) * 1000
     card_id = first_review - 3 * 86_400 * 1000
-    deck_config_overrides: dict[str, object] = {
-        "rwkvReviewFirstReviewElapsedFromCardCreation": False,
-    }
+    global_setting = False
     rows = [(first_review, card_id, 10, 100, 2, 1234, 0, 3, 2500)]
     monkeypatch.setattr(
         rwkv_scheduler,
@@ -8207,11 +8954,13 @@ def test_reviewer_rwkv_cache_rebuilds_when_replay_semantics_change(
     reviewer = _rwkv_cache_reviewer(
         profile_folder=tmp_path,
         rows=rows,
-        deck_config_overrides=deck_config_overrides,
+    )
+    reviewer.mw.col.get_config = lambda key: (
+        global_setting if key == "rwkvDynamicPresetReplay" else None
     )
     assert rwkv_scheduler._warm_up_reviewer_backend(reviewer) is True
 
-    deck_config_overrides["rwkvReviewFirstReviewElapsedFromCardCreation"] = True
+    global_setting = True
     rebuilt_runtime = _CacheRuntime()
     set_reviewer_backend(RwkvStatefulReviewerBackend(rebuilt_runtime))
 
@@ -10178,6 +10927,244 @@ def test_rwkv_calibration_recompute_uses_fsrs_validation_folds(
             -1,
         ),
     }
+
+
+def test_rwkv_calibration_recompute_prunes_superseded_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    first_review = (40 * 86_400 + 100) * 1000
+    second_review = (41 * 86_400 + 3_700) * 1000
+    rows = [
+        (first_review, 1, 10, 100, 2, 1234, 1, 3, 2500),
+        (second_review, 1, 10, 100, 3, 2345, 2, 5, 2400),
+    ]
+    monkeypatch.setattr(
+        rwkv_scheduler,
+        "_rwkv_model_cache_key",
+        lambda: {"model": "test"},
+    )
+
+    backend = RwkvStatefulReviewerBackend(_CacheRuntime())
+    set_reviewer_backend(backend)
+    reviewer = _rwkv_cache_reviewer(profile_folder=tmp_path, rows=rows)
+    assert rwkv_scheduler.warm_up_rwkv_state(reviewer.mw) is True
+    deleted_review, legacy_review, answered_review = 7, 8, 9
+    reviewer.mw.col.rwkv_retrievability_rows[:] = [
+        (deleted_review, 0.4, "rwkv_calibration_recompute", 0, "test_fold", 1),
+        (legacy_review, 0.5, "rwkv_calibration_train", 0, "final_fit", -1),
+        (answered_review, 0.6, "rwkv_review", 0, "post_optimization", -1),
+    ]
+
+    assert rwkv_scheduler.recompute_rwkv_calibration_data(reviewer.mw) is True
+
+    remaining = {
+        review_id: source
+        for review_id, _prediction, source, _updated_at, _role, _fold in (
+            reviewer.mw.col.rwkv_retrievability_rows
+        )
+    }
+    assert remaining == {
+        answered_review: "rwkv_review",
+        first_review: "rwkv_calibration_recompute",
+        second_review: "rwkv_calibration_recompute",
+    }
+
+
+def test_rwkv_calibration_epoch_follows_state_cache_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        rwkv_scheduler,
+        "_rwkv_model_cache_key",
+        lambda: {"model": "test"},
+    )
+    monkeypatch.setattr(
+        rwkv_scheduler,
+        "_rwkv_state_cache_metadata_usable",
+        lambda *_args, **_kwargs: True,
+    )
+    cache_dir = tmp_path / rwkv_scheduler._RWKV_STATE_CACHE_DIR
+    cache_dir.mkdir()
+    metadata: dict[str, object] = {
+        "collection": {"created": 1},
+        "model": {"model": "test"},
+        "replayKey": "replay",
+        "presetReplaySemantics": 3,
+        "dynamicPresetReplay": False,
+        "storeGeneration": "generation-1",
+        "snapshotSegmentId": 2,
+        "snapshotHistoryHash": "a" * 64,
+        "lastReviewId": 5,
+    }
+
+    def write_metadata(**changes: object) -> None:
+        (cache_dir / rwkv_scheduler._RWKV_STATE_CACHE_META_FILE).write_text(
+            json.dumps({**metadata, **changes})
+        )
+
+    reviewer = SimpleNamespace(
+        mw=SimpleNamespace(pm=SimpleNamespace(profileFolder=lambda: str(tmp_path)))
+    )
+    write_metadata()
+    rwkv_scheduler._write_rwkv_calibration_epoch(reviewer, cast(Any, None))
+    assert rwkv_scheduler._rwkv_calibration_epoch_current(reviewer) is True
+
+    # New answers extend the delta log without changing the lineage.
+    write_metadata(lastReviewId=9)
+    assert rwkv_scheduler._rwkv_calibration_epoch_current(reviewer) is True
+    # A recovery writes a new segment and a rebuild a new store.
+    write_metadata(snapshotSegmentId=3)
+    assert rwkv_scheduler._rwkv_calibration_epoch_current(reviewer) is False
+    write_metadata(storeGeneration="generation-2")
+    assert rwkv_scheduler._rwkv_calibration_epoch_current(reviewer) is False
+    # Ignored reviews make the state differ from the full replayed history.
+    write_metadata(ignoredReviewIds=[4])
+    assert rwkv_scheduler._rwkv_calibration_epoch_current(reviewer) is False
+    rwkv_scheduler._write_rwkv_calibration_epoch(reviewer, cast(Any, None))
+    assert not (cache_dir / rwkv_scheduler._RWKV_CALIBRATION_EPOCH_FILE).exists()
+
+
+def test_rwkv_calibration_realign_relabels_existing_predictions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [
+        (1, 0.5, "final_fit", -1),
+        (2, 0.25, "final_fit", -1),
+        (3, 0.75, "test_fold", 1),
+    ]
+    written: list[tuple[object, ...]] = []
+    pruned: list[list[tuple[object, ...]]] = []
+
+    class Backend:
+        def set_rwkv_review_retrievability_cache_rows(
+            self, *, source: str, rows: Sequence[Any]
+        ) -> None:
+            written.extend(
+                (source, row.revlog_id, row.prediction, row.sample_role, row.fold_index)
+                for row in rows
+            )
+
+        def prune_rwkv_review_retrievability_cache_rows(
+            self,
+            *,
+            source: str,
+            keep: Sequence[Any],
+            superseded_sources: Sequence[str],
+        ) -> int:
+            pruned.append(
+                sorted((key.revlog_id, key.sample_role, key.fold_index) for key in keep)
+            )
+            return 0
+
+    collection = SimpleNamespace(
+        _backend=Backend(),
+        db=SimpleNamespace(all=lambda _sql, *_args: list(rows)),
+    )
+    reviewer = SimpleNamespace(mw=SimpleNamespace(col=collection))
+    answer = SimpleNamespace(ease=3)
+    history = SimpleNamespace(review_ids=[1, 2, 3], reviews=[answer, answer, answer])
+    monkeypatch.setattr(
+        rwkv_scheduler, "_rwkv_calibration_epoch_current", lambda _reviewer: True
+    )
+    monkeypatch.setattr(
+        rwkv_scheduler,
+        "_rwkv_calibration_data_available",
+        lambda _reviewer, *, history: True,
+    )
+    monkeypatch.setattr(
+        rwkv_scheduler,
+        "_rwkv_calibration_fold_role_maps",
+        lambda _reviewer, _history: (
+            {1: "test_fold", 2: "final_fit", 3: "test_fold"},
+            {1: 0, 3: 1},
+        ),
+    )
+
+    assert rwkv_scheduler._realign_rwkv_calibration_data(reviewer, cast(Any, history))
+    # Only review 1 changed role; its prediction is reused, not replayed.
+    assert written == [("rwkv_calibration_recompute", 1, 0.5, "test_fold", 0)]
+    assert pruned == [[(1, "test_fold", 0), (2, "final_fit", -1), (3, "test_fold", 1)]]
+
+    written.clear()
+    pruned.clear()
+    history.review_ids.append(4)
+    history.reviews.append(answer)
+    # An answer without a prediction needs the full recompute instead.
+    assert not rwkv_scheduler._realign_rwkv_calibration_data(
+        reviewer, cast(Any, history)
+    )
+    assert written == []
+    assert pruned == []
+
+
+def test_rwkv_answered_review_retrievability_queries_pre_answer_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _CacheRuntime()
+    backend = RwkvStatefulReviewerBackend(runtime)
+    review_input = replace(
+        _rwkv_review_input(card_id=1, note_id=10),
+        is_query=False,
+        ease=3,
+        duration_millis=4000,
+    )
+    monkeypatch.setattr(
+        rwkv_scheduler,
+        "rwkv_review_identity",
+        lambda _reviewer, _card: review_input.identity,
+    )
+    monkeypatch.setattr(
+        rwkv_scheduler, "rwkv_review_input", lambda **_kwargs: review_input
+    )
+
+    assert backend.answered_review_retrievability(
+        reviewer=object(), card=object(), ease=3
+    ) == pytest.approx(0.45)
+    # Querying never applies the answer to the recurrent state.
+    assert runtime.reviewed == []
+
+
+def test_rwkv_answer_calibration_prediction_records_only_in_current_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    written: list[tuple[str, int, float]] = []
+
+    class Backend:
+        def set_rwkv_review_retrievability_cache_rows(
+            self, *, source: str, rows: Sequence[Any]
+        ) -> None:
+            written.extend((source, row.revlog_id, row.prediction) for row in rows)
+
+    collection = SimpleNamespace(
+        _backend=Backend(),
+        db=SimpleNamespace(scalar=lambda _sql, card_id: 70 + card_id),
+    )
+    reviewer = SimpleNamespace(mw=SimpleNamespace(col=collection))
+    card = SimpleNamespace(id=7)
+    predictor = SimpleNamespace(
+        answered_review_retrievability=lambda **_kwargs: 0.5,
+    )
+    epoch_current = [False]
+    monkeypatch.setattr(
+        rwkv_scheduler,
+        "_rwkv_calibration_epoch_current",
+        lambda _reviewer: epoch_current[0],
+    )
+
+    assert (
+        rwkv_scheduler._rwkv_answer_calibration_prediction(reviewer, predictor, card, 3)
+        is None
+    )
+    epoch_current[0] = True
+    prediction = rwkv_scheduler._rwkv_answer_calibration_prediction(
+        reviewer, predictor, card, 3
+    )
+    assert prediction == 0.5
+    rwkv_scheduler._record_rwkv_answer_calibration_prediction(reviewer, card, 0.5)
+    # The answer's own revlog row, under the recompute source.
+    assert written == [("rwkv_calibration_recompute", 77, 0.5)]
 
 
 def test_rwkv_calibration_fold_roles_fall_back_to_chronological_split(
@@ -14292,6 +15279,9 @@ def test_deck_browser_count_prepare_failure_after_cancellation_is_ignored(
 def test_selecting_deck_cancels_counts_and_defers_overview_until_after_hooks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from aqt.utils import tr
+
+    monkeypatch.setattr(tr, "_translate", lambda *args, **kwargs: "")
     from aqt.deckbrowser import DeckBrowser
 
     events: list[str] = []
@@ -15068,6 +16058,7 @@ def rwkv_filtered_deck_context(
 @pytest.mark.parametrize("outcome", ["ready", "prediction_error", "state_advance"])
 def test_filtered_deck_waits_for_busy_backend_before_mutating(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     rwkv_filtered_deck_context: tuple[SimpleNamespace, FilteredDeckConfig],
     operation: str,
     outcome: str,
@@ -15100,7 +16091,7 @@ def test_filtered_deck_waits_for_busy_backend_before_mutating(
 
     reviewer, config = rwkv_filtered_deck_context
     col = reviewer.mw.col
-    deck = FilteredDeckForUpdate(id=200, config=config)
+    deck = FilteredDeckForUpdate(id=200, name="Anatomie 🩺", config=config)
     col.sched.get_or_create_filtered_deck = lambda **kwargs: deck
     mutations: list[int] = []
 
@@ -15170,6 +16161,10 @@ def test_filtered_deck_waits_for_busy_backend_before_mutating(
     assert not filtered.is_alive()
     if outcome == "ready":
         assert errors == []
+        assert not any(
+            record.message.startswith("RWKV filtered-deck preparation failed")
+            for record in caplog.records
+        )
         assert mutations == [200]
         assert results == [
             collection_pb2.OpChangesWithCount(count=1)
@@ -15187,6 +16182,112 @@ def test_filtered_deck_waits_for_busy_backend_before_mutating(
         assert len(errors) == 1
         assert isinstance(errors[0], RuntimeError)
         assert str(errors[0]) == "RWKV filtered-deck preparation failed"
+        message = next(
+            record.message
+            for record in caplog.records
+            if record.message.startswith("RWKV filtered-deck preparation failed")
+        )
+        assert (
+            f"operation={'rebuild' if operation == 'rebuild' else 'add_or_update'}"
+            in message
+        )
+        assert "deck_id=200" in message
+        assert "deck_name='Anatomie 🩺'" in message
+        assert "status=failed" in message
+        assert "'search': 'deck:current'" in message
+        assert "'order': 'RETRIEVABILITY_ASCENDING'" in message
+        reason = "exception" if outcome == "prediction_error" else "state_changed"
+        assert any(
+            record.message.startswith("RWKV filtered-deck scoring stopped")
+            and f"reason={reason}" in record.message
+            for record in caplog.records
+        )
+        if outcome == "prediction_error":
+            record = next(
+                record
+                for record in caplog.records
+                if record.message.startswith("RWKV stats retrievability scoring failed")
+            )
+            assert "phase=fallback_scoring" in record.message
+            assert record.exc_info is not None
+            assert str(record.exc_info[1]) == "prediction failed"
+
+
+def test_filtered_deck_warmup_failure_logs_both_filters(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    rwkv_filtered_deck_context: tuple[SimpleNamespace, FilteredDeckConfig],
+) -> None:
+    from anki.scheduler import FilteredDeckForUpdate
+    from aqt.operations import scheduling
+
+    reviewer, config = rwkv_filtered_deck_context
+    config.search_terms.add(
+        search="tag:inactive", limit=0, order=FilteredDeckConfig.SearchTerm.RANDOM
+    )
+    config.reschedule = True
+    deck = FilteredDeckForUpdate(id=200, name="Anatomie", config=config)
+    set_reviewer_backend(object())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        rwkv_scheduler,
+        "_prepare_reviewer_backend_for_filtered_deck",
+        lambda reviewer: False,
+    )
+
+    with pytest.raises(RuntimeError, match="RWKV filtered-deck preparation failed"):
+        scheduling._prepare_filtered_deck_retrievability_scores(
+            reviewer.mw.col, deck, operation="rebuild"
+        )
+
+    messages = [record.message for record in caplog.records]
+    assert any(
+        "reason=warmup_not_ready phase=warmup status=failed" in message
+        for message in messages
+    )
+    message = next(
+        message
+        for message in messages
+        if message.startswith("RWKV filtered-deck preparation failed")
+    )
+    assert "reschedule=True" in message
+    assert (
+        "'filter': 1, 'search': 'deck:current', 'limit': 100, "
+        "'order': 'RETRIEVABILITY_ASCENDING'" in message
+    )
+    assert (
+        "'filter': 2, 'search': 'tag:inactive', 'limit': 0, 'order': 'RANDOM'"
+        in message
+    )
+
+
+def test_filtered_deck_random_filters_log_scores_not_required(
+    caplog: pytest.LogCaptureFixture,
+    rwkv_filtered_deck_context: tuple[SimpleNamespace, FilteredDeckConfig],
+) -> None:
+    from anki.scheduler import FilteredDeckForUpdate
+    from aqt.operations import scheduling
+
+    reviewer, config = rwkv_filtered_deck_context
+    config.search_terms[
+        0
+    ].search = '"deck:Medizin 🩺::Ankiphil - Vorklinik::Anatomie" is:due prop:due>-7'
+    config.search_terms[0].order = FilteredDeckConfig.SearchTerm.RANDOM
+    config.search_terms.add(
+        search="(is:due OR is:new) tag:#Ankiphil_Vorklinik_v6.0::#Fächer::Anatomie::Blut",
+        limit=100,
+        order=FilteredDeckConfig.SearchTerm.RANDOM,
+    )
+    deck = FilteredDeckForUpdate(id=200, name="Anatomie", config=config)
+
+    with caplog.at_level("DEBUG", logger="aqt.rwkv_scheduler"):
+        scheduling._prepare_filtered_deck_retrievability_scores(
+            reviewer.mw.col, deck, operation="rebuild"
+        )
+
+    assert any("status=not_required" in record.message for record in caplog.records)
+    assert not any(
+        record.levelname in {"WARNING", "ERROR"} for record in caplog.records
+    )
 
 
 def test_filtered_deck_prepares_scores_when_concurrent_stats_are_deferred(
@@ -19792,6 +20893,30 @@ def _rwkv_cache_reviewer(
             rwkv_retrievability_rows[:] = [
                 existing[review_id] for review_id in sorted(existing)
             ]
+
+        def prune_rwkv_review_retrievability_cache_rows(
+            self,
+            *,
+            source: str,
+            keep: Sequence[object],
+            superseded_sources: Sequence[str],
+        ) -> int:
+            kept = {
+                (
+                    getattr(key, "revlog_id"),
+                    getattr(key, "sample_role"),
+                    getattr(key, "fold_index"),
+                )
+                for key in keep
+            }
+            before = len(rwkv_retrievability_rows)
+            rwkv_retrievability_rows[:] = [
+                row
+                for row in rwkv_retrievability_rows
+                if row[2] not in superseded_sources
+                and (row[2] != source or (row[0], row[4], row[5]) in kept)
+            ]
+            return before - len(rwkv_retrievability_rows)
 
     class Scheduler:
         def _timing_today(self) -> SimpleNamespace:
