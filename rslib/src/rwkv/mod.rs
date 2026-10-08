@@ -1290,6 +1290,62 @@ insert into segments (
         Ok(())
     }
 
+    /// Writes the warm-up states one at a time, without holding a second copy
+    /// of them in memory (kuma3's offline state file): the card, note, deck
+    /// and preset maps (u64 count, then i64 id + state, by id), then the
+    /// global state (flag byte + state). A state is stored as 16-bit floats
+    /// (see [write_half_module_state]): half the size, and the RWKV
+    /// predictions don't change measurably.
+    pub fn write_warm_up_states(&self, out: &mut impl io::Write) -> io::Result<()> {
+        let states = &self.warm_up_states;
+        for map in [&states.card, &states.note, &states.deck, &states.preset] {
+            out.write_all(&(map.len() as u64).to_le_bytes())?;
+            let mut map: Vec<_> = map.iter().collect();
+            map.sort_unstable_by_key(|(id, _)| **id);
+            for (id, state) in map {
+                out.write_all(&id.to_le_bytes())?;
+                write_half_module_state(out, state)?;
+            }
+        }
+        match &states.global {
+            Some(state) => {
+                out.write_all(&[1])?;
+                write_half_module_state(out, state)
+            }
+            None => out.write_all(&[0]),
+        }
+    }
+
+    /// Reads what [Self::write_warm_up_states] wrote, one state at a time.
+    pub fn read_warm_up_states(&mut self, input: &mut impl io::Read) -> io::Result<()> {
+        let mut buffer = Vec::new();
+        let mut maps: [HashMap<i64, ModuleState>; 4] = Default::default();
+        for map in &mut maps {
+            let count = read_u64_le(input)?;
+            map.reserve(count.min(1 << 20) as usize);
+            for _ in 0..count {
+                let id = read_u64_le(input)? as i64;
+                map.insert(id, read_half_module_state(input, &mut buffer)?);
+            }
+        }
+        let mut flag = [0_u8];
+        input.read_exact(&mut flag)?;
+        let global = match flag[0] {
+            1 => Some(read_half_module_state(input, &mut buffer)?),
+            _ => None,
+        };
+        let [card, note, deck, preset] = maps;
+        self.warm_up_states = ReviewStateMaps {
+            card,
+            note,
+            deck,
+            preset,
+            global,
+            ..Default::default()
+        };
+        Ok(())
+    }
+
     pub fn restore_warm_up_state(
         &mut self,
         card_id: i64,
@@ -4171,6 +4227,121 @@ fn write_serialized_module_state(out: &mut impl io::Write, state: &ModuleState) 
         )?;
     }
     Ok(())
+}
+
+/// u32 layer count, then per layer its time-mix shift, time-mix matrix and
+/// channel-mix shift, each as u32 length + IEEE half floats (little endian).
+/// The values are small (|x| < 10 in big collections) and a half keeps them to
+/// 0.05%; with states rounded like this after every review, the fork's state
+/// compression metric gave the same log loss and RMSE as full floats.
+fn write_half_module_state(out: &mut impl io::Write, state: &ModuleState) -> io::Result<()> {
+    out.write_all(&(state.layers.len() as u32).to_le_bytes())?;
+    let mut bytes = Vec::new();
+    for layer in &state.layers {
+        let time = layer.time.as_ref();
+        for values in [
+            time.map_or(&[][..], |time| time.x_shift.as_slice()),
+            time.map_or(&[][..], |time| time.matrix.as_slice()),
+            layer.channel_shift.as_deref().unwrap_or_default(),
+        ] {
+            bytes.clear();
+            bytes.extend_from_slice(&(values.len() as u32).to_le_bytes());
+            for value in values {
+                bytes.extend_from_slice(&f16_bits(*value).to_le_bytes());
+            }
+            out.write_all(&bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_u64_le(input: &mut impl io::Read) -> io::Result<u64> {
+    let mut bytes = [0_u8; 8];
+    input.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_u32_le(input: &mut impl io::Read) -> io::Result<u32> {
+    let mut bytes = [0_u8; 4];
+    input.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+/// Reads what [write_half_module_state] wrote; `buffer` is reused between
+/// states.
+fn read_half_module_state(
+    input: &mut impl io::Read,
+    buffer: &mut Vec<u8>,
+) -> io::Result<ModuleState> {
+    let layer_count = read_u32_le(input)?;
+    if layer_count > 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "damaged RWKV state",
+        ));
+    }
+    fn read_values(input: &mut impl io::Read, buffer: &mut Vec<u8>) -> io::Result<Vec<f32>> {
+        let len = read_u32_le(input)? as usize;
+        if len > 1 << 20 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "damaged RWKV state",
+            ));
+        }
+        buffer.resize(len * 2, 0);
+        input.read_exact(buffer)?;
+        Ok(buffer
+            .chunks_exact(2)
+            .map(|half| f32_from_f16_bits(u16::from_le_bytes([half[0], half[1]])))
+            .collect())
+    }
+    let mut layers = Vec::with_capacity(layer_count as usize);
+    for _ in 0..layer_count {
+        let x_shift = read_values(input, buffer)?;
+        let matrix = read_values(input, buffer)?;
+        let channel_shift = read_values(input, buffer)?;
+        layers.push(LayerState {
+            time: Some(TimeState { x_shift, matrix }),
+            channel_shift: Some(channel_shift),
+        });
+    }
+    Ok(ModuleState { layers })
+}
+
+/// IEEE half of `value`, rounded to nearest (ties to even).
+fn f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let abs = bits & 0x7fff_ffff;
+    if abs > 0x7f80_0000 {
+        return sign | 0x7e00; // NaN
+    }
+    if abs >= 0x477f_f000 {
+        return sign | 0x7c00; // rounds to 65520 or more: infinity
+    }
+    if abs >= 0x3880_0000 {
+        // normal: rebias the exponent, round away the low 13 mantissa bits
+        let rounded = abs + 0x0fff + ((abs >> 13) & 1);
+        return sign | ((rounded - 0x3800_0000) >> 13) as u16;
+    }
+    // subnormal (or zero): steps of 2^-24
+    sign | (f32::from_bits(abs) * 16_777_216.0).round_ties_even() as u16
+}
+
+fn f32_from_f16_bits(half: u16) -> f32 {
+    let magnitude = match (half >> 10) & 0x1f {
+        0 => f32::from(half & 0x3ff) / 16_777_216.0,
+        0x1f if half & 0x3ff == 0 => f32::INFINITY,
+        0x1f => f32::NAN,
+        exponent => {
+            f32::from_bits((u32::from(exponent) + 112) << 23 | u32::from(half & 0x3ff) << 13)
+        }
+    };
+    if half & 0x8000 != 0 {
+        -magnitude
+    } else {
+        magnitude
+    }
 }
 
 fn write_snapshot_module_state(out: &mut impl io::Write, state: &ModuleState) -> io::Result<()> {
@@ -11151,6 +11322,29 @@ order by e.id, e.cid
         assert_eq!(features.previous_day_offset, None);
         assert_eq!(features.today_reviews, 0);
         assert_eq!(features.today_new_cards, 0);
+    }
+
+    #[test]
+    fn f16_conversion_round_trips_and_rounds() {
+        for half in 0..=u16::MAX {
+            let value = f32_from_f16_bits(half);
+            if value.is_nan() {
+                assert!(f16_bits(value) & 0x7c00 == 0x7c00 && f16_bits(value) & 0x3ff != 0);
+            } else {
+                assert_eq!(f16_bits(value), half, "{half:#06x} {value}");
+            }
+        }
+        assert_eq!(f16_bits(1.0), 0x3c00);
+        assert_eq!(f16_bits(-2.0), 0xc000);
+        assert_eq!(f16_bits(65504.0), 0x7bff);
+        assert_eq!(f16_bits(65520.0), 0x7c00);
+        // halfway between 1.0 and the next half: ties to the even one (1.0)
+        assert_eq!(f16_bits(1.0 + 1.0 / 2048.0), 0x3c00);
+        assert_eq!(f16_bits(1.0 + 3.0 / 2048.0), 0x3c02);
+        // smallest subnormal, and half of it (ties to even: zero)
+        assert_eq!(f16_bits(5.960_464_5e-8), 0x0001);
+        assert_eq!(f16_bits(2.980_232_2e-8), 0x0000);
+        assert_eq!(f16_bits(0.333_333_34), 0x3555);
     }
 
     #[test]

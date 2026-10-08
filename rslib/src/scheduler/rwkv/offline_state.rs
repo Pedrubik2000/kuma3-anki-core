@@ -5,27 +5,34 @@
 //! (`collection.rwkv-offline`, next to the collection), so that a start
 //! replays only the reviews that came after it instead of the whole history.
 //!
-//! It holds the model state (the engine's warm-up snapshot and cache state)
+//! It holds the model state (the engine's warm-up states and cache state)
 //! and the identity of the review history it has absorbed. The header ties it
 //! to one backend build and one model file: anything else is ignored, and the
 //! history is replayed in full as before. `offline.rs` decides when to write
 //! and read it; the history check there catches a file that no longer fits
 //! the collection.
+//!
+//! The states are streamed to and from the file, as half floats: with a big
+//! history the file was over 1 GB, and holding it in memory next to the
+//! engine's own copy got the app's neighbours killed on phones.
+//!
+//! The file never leaves the device (it is not synced; the desktop keeps its
+//! own state), so its format can change freely: a file in an old format is
+//! ignored and the history replayed once.
 
 use std::fs;
 use std::io;
+use std::io::BufReader;
+use std::io::BufWriter;
+use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 
-use crate::rwkv::RwkvWarmUpSnapshot;
+use crate::rwkv::RwkvInference;
 
-const MAGIC: &[u8] = b"KUMA3RWKVOFFLINE1\n";
-
-pub(super) struct SavedState {
-    pub identity: Vec<u8>,
-    pub snapshot: RwkvWarmUpSnapshot,
-    pub cache_state: Vec<u8>,
-}
+/// 2: states as half floats (1: full floats).
+const MAGIC: &[u8] = b"KUMA3RWKVOFFLINE2\n";
+const BUFFER: usize = 1 << 20;
 
 /// What the file must have been written for: this backend build and this model
 /// file (its size and an FNV-1a hash of its bytes).
@@ -50,125 +57,116 @@ pub(super) fn write(
     path: &Path,
     header: &str,
     identity: &[u8],
-    snapshot: &RwkvWarmUpSnapshot,
-    cache_state: &[u8],
+    inference: &RwkvInference,
 ) -> io::Result<()> {
-    let mut out = Vec::new();
-    out.extend_from_slice(MAGIC);
-    put_bytes(&mut out, header.as_bytes());
-    put_bytes(&mut out, identity);
-    for map in [
-        &snapshot.card_states,
-        &snapshot.note_states,
-        &snapshot.deck_states,
-        &snapshot.preset_states,
-    ] {
-        out.extend_from_slice(&(map.len() as u64).to_le_bytes());
-        for (id, state) in map {
-            out.extend_from_slice(&id.to_le_bytes());
-            put_bytes(&mut out, state);
-        }
-    }
-    match &snapshot.global_state {
-        Some(state) => {
-            out.push(1);
-            put_bytes(&mut out, state);
-        }
-        None => out.push(0),
-    }
-    put_bytes(&mut out, cache_state);
-
     let temporary = path.with_extension("rwkv-offline.tmp");
-    let mut file = fs::File::create(&temporary)?;
-    file.write_all(&out)?;
+    let mut out = BufWriter::with_capacity(BUFFER, fs::File::create(&temporary)?);
+    out.write_all(MAGIC)?;
+    put_bytes(&mut out, header.as_bytes())?;
+    put_bytes(&mut out, identity)?;
+    inference.write_warm_up_states(&mut out)?;
+    put_bytes(&mut out, &inference.cache_state())?;
+    let file = out.into_inner().map_err(|err| err.into_error())?;
     file.sync_all()?;
     drop(file);
     fs::rename(&temporary, path)
 }
 
-/// Reads the file written by [write]; an error when it is missing, damaged or
-/// was written for another header.
-pub(super) fn read(path: &Path, header: &str) -> io::Result<SavedState> {
-    let data = fs::read(path)?;
-    let mut input = Reader { data: &data, at: 0 };
-    if input.take(MAGIC.len())? != MAGIC {
-        return Err(invalid("not an offline RWKV state file"));
-    }
-    if input.bytes()? != header.as_bytes() {
-        return Err(invalid("written by another build or for another model"));
-    }
-    let identity = input.bytes()?.to_vec();
-    let mut maps = Vec::with_capacity(4);
-    for _ in 0..4 {
-        let count = input.u64()? as usize;
-        let mut map = Vec::with_capacity(count.min(1 << 20));
-        for _ in 0..count {
-            let id = input.i64()?;
-            map.push((id, input.bytes()?.to_vec()));
-        }
-        maps.push(map);
-    }
-    let global_state = match input.take(1)?[0] {
-        1 => Some(input.bytes()?.to_vec()),
-        _ => None,
-    };
-    let cache_state = input.bytes()?.to_vec();
-    if input.at != data.len() {
+/// Reads the file written by [write] into `inference` and returns the history
+/// identity; an error when it is missing, damaged or was written for another
+/// header. After an error `inference` may hold part of the file: reset it.
+pub(super) fn read(
+    path: &Path,
+    header: &str,
+    inference: &mut RwkvInference,
+) -> io::Result<Vec<u8>> {
+    let mut input = BufReader::with_capacity(BUFFER, fs::File::open(path)?);
+    let identity = read_head(&mut input, header)?;
+    inference.read_warm_up_states(&mut input)?;
+    inference.restore_cache_state(&get_bytes(&mut input, 1 << 30)?)?;
+    if input.read(&mut [0])? != 0 {
         return Err(invalid("trailing data"));
     }
-    let preset_states = maps.pop().unwrap_or_default();
-    let deck_states = maps.pop().unwrap_or_default();
-    let note_states = maps.pop().unwrap_or_default();
-    let card_states = maps.pop().unwrap_or_default();
-    Ok(SavedState {
-        identity,
-        snapshot: RwkvWarmUpSnapshot {
-            card_states,
-            note_states,
-            deck_states,
-            preset_states,
-            global_state,
-        },
-        cache_state,
-    })
+    Ok(identity)
 }
 
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(bytes);
+/// Just the history identity of the file at `path` (it comes first), without
+/// the states.
+pub(super) fn read_identity(path: &Path, header: &str) -> io::Result<Vec<u8>> {
+    read_head(&mut BufReader::new(fs::File::open(path)?), header)
+}
+
+fn read_head(input: &mut impl Read, header: &str) -> io::Result<Vec<u8>> {
+    let mut magic = [0_u8; MAGIC.len()];
+    input.read_exact(&mut magic)?;
+    if magic != MAGIC {
+        return Err(invalid("not an offline RWKV state file"));
+    }
+    if get_bytes(input, 4096)? != header.as_bytes() {
+        return Err(invalid("written by another build or for another model"));
+    }
+    get_bytes(input, 1 << 20)
+}
+
+fn put_bytes(out: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    out.write_all(&(bytes.len() as u64).to_le_bytes())?;
+    out.write_all(bytes)
+}
+
+fn get_bytes(input: &mut impl Read, max: u64) -> io::Result<Vec<u8>> {
+    let mut len = [0_u8; 8];
+    input.read_exact(&mut len)?;
+    let len = u64::from_le_bytes(len);
+    if len > max {
+        return Err(invalid("length"));
+    }
+    let mut bytes = vec![0; len as usize];
+    input.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
 }
 
-struct Reader<'a> {
-    data: &'a [u8],
-    at: usize,
-}
+#[cfg(test)]
+mod tests {
+    use std::env;
+    use std::path::PathBuf;
+    use std::time::Instant;
 
-impl<'a> Reader<'a> {
-    fn take(&mut self, len: usize) -> io::Result<&'a [u8]> {
-        let end = self
-            .at
-            .checked_add(len)
-            .filter(|end| *end <= self.data.len())
-            .ok_or_else(|| invalid("truncated"))?;
-        let bytes = &self.data[self.at..end];
-        self.at = end;
-        Ok(bytes)
-    }
+    use super::*;
 
-    fn u64(&mut self) -> io::Result<u64> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
+    /// Reads a real state file (`KUMA3_RWKV_OFFLINE_FILE`, with the model it
+    /// was written for in `KUMA3_RWKV_OFFLINE_MODEL`) and writes it back: the
+    /// bytes must not change. The header is taken from the file, since this
+    /// test build has another build hash.
+    #[test]
+    #[ignore]
+    fn offline_state_file_round_trip() {
+        let (Ok(file), Ok(model)) = (
+            env::var("KUMA3_RWKV_OFFLINE_FILE"),
+            env::var("KUMA3_RWKV_OFFLINE_MODEL"),
+        ) else {
+            eprintln!("set KUMA3_RWKV_OFFLINE_FILE and KUMA3_RWKV_OFFLINE_MODEL");
+            return;
+        };
+        let file = PathBuf::from(file);
+        let mut input = BufReader::new(fs::File::open(&file).unwrap());
+        input.read_exact(&mut [0; MAGIC.len()]).unwrap();
+        let header = String::from_utf8(get_bytes(&mut input, 4096).unwrap()).unwrap();
+        drop(input);
 
-    fn i64(&mut self) -> io::Result<i64> {
-        Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-
-    fn bytes(&mut self) -> io::Result<&'a [u8]> {
-        let len = usize::try_from(self.u64()?).map_err(|_| invalid("length"))?;
-        self.take(len)
+        let mut inference = RwkvInference::load(PathBuf::from(model), 0.9, 36_500).unwrap();
+        let started = Instant::now();
+        let identity = read(&file, &header, &mut inference).unwrap();
+        eprintln!("read {} ms", started.elapsed().as_millis());
+        let copy = file.with_extension("roundtrip");
+        let started = Instant::now();
+        write(&copy, &header, &identity, &inference).unwrap();
+        eprintln!("write {} ms", started.elapsed().as_millis());
+        let same = fs::read(&copy).unwrap() == fs::read(&file).unwrap();
+        fs::remove_file(&copy).unwrap();
+        assert!(same, "the written file differs from the one read");
     }
 }

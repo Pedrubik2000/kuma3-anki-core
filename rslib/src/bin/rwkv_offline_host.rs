@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut col = CollectionBuilder::new(&args[1]).build()?;
 
     let start = Instant::now();
-    let prepared = SchedulerService::rwkv_prepare_offline(
+    let prepared = prepare_and_wait(
         &mut col,
         RwkvPrepareOfflineRequest {
             model_path: args[2].clone(),
@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let start = Instant::now();
-    let again = SchedulerService::rwkv_prepare_offline(
+    let again = prepare_and_wait(
         &mut col,
         RwkvPrepareOfflineRequest {
             model_path: args[2].clone(),
@@ -116,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     col.close(None)?;
     let mut col = CollectionBuilder::new(&args[1]).build()?;
     let start = Instant::now();
-    let reopened = SchedulerService::rwkv_prepare_offline(
+    let reopened = prepare_and_wait(
         &mut col,
         RwkvPrepareOfflineRequest {
             model_path: args[2].clone(),
@@ -131,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         all_scores(&mut col)?
     };
     println!(
-        "reopen: state file {} KB; {} reviews replayed, prepare {} ms; {} scores, equal to before: {}",
+        "reopen: state file {} KB; {} reviews replayed, prepare {} ms; {} scores, equal to before: {} (max difference {:.6})",
         std::fs::metadata(&state_file).map_or(0, |m| m.len() / 1024),
         reopened.reviews_replayed,
         prepare_ms,
@@ -141,6 +141,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .zip(&after_reopen)
                 .all(|(a, b)| a.0 == b.0 && (a.1 - b.1).abs() < 1e-5),
+        before_reopen
+            .iter()
+            .zip(&after_reopen)
+            .map(|(a, b)| (a.1 - b.1).abs())
+            .fold(0.0f32, f32::max),
     );
 
     let now = std::time::SystemTime::now()
@@ -323,7 +328,7 @@ fn answer_check(
             std::fs::remove_file(&state_file)?;
         }
         let mut col = CollectionBuilder::new(col_path).build()?;
-        let prepared = SchedulerService::rwkv_prepare_offline(
+        let prepared = prepare_and_wait(
             &mut col,
             RwkvPrepareOfflineRequest {
                 model_path: model_path.into(),
@@ -352,4 +357,25 @@ fn answer_check(
         col.close(None)?;
     }
     Ok(())
+}
+
+/// The prepare call returns while the runtime is still being built on its own
+/// thread (as on the phone); this waits for it, so the checks see RWKV scores.
+fn prepare_and_wait(
+    col: &mut anki::collection::Collection,
+    request: RwkvPrepareOfflineRequest,
+) -> anki::error::Result<anki_proto::scheduler::RwkvPrepareOfflineResponse> {
+    let prepared = SchedulerService::rwkv_prepare_offline(col, request)?;
+    while !SchedulerService::rwkv_offline_instant_pass_step(
+        col,
+        RwkvOfflineInstantPassStepRequest {
+            status_only: true,
+            ..Default::default()
+        },
+    )?
+    .available
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(prepared)
 }
