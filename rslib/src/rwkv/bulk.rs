@@ -31,9 +31,11 @@ use rayon::prelude::*;
 
 use super::*;
 
-/// Rows processed per internal chunk. This matches the desktop bridge's
-/// measured sweet spot while bounding scratch-buffer memory for large replays.
-const BULK_CHUNK_ROWS: usize = 8_192;
+/// Rows processed per internal chunk. A chunk holds the f32 states of every
+/// card and note it touches (kuma3 keeps them as halves otherwise), so kuma3
+/// uses a quarter of the desktop bridge's 8192: a 203k-review replay on a PC
+/// peaked at 1.33 GB instead of 1.83 GB, and took 16.4 s instead of 14.7 s.
+const BULK_CHUNK_ROWS: usize = 2_048;
 
 #[derive(Clone, Copy)]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -345,9 +347,9 @@ fn take_stream_state(
     key: i64,
 ) -> Option<ModuleState> {
     match module_id {
-        0 => states.card.remove(&key),
+        0 => states.card.take(&key),
         1 => states.deck.remove(&key),
-        2 => states.note.remove(&key),
+        2 => states.note.take(&key),
         3 => states.preset.remove(&key),
         _ => states.global.take(),
     }
@@ -356,13 +358,13 @@ fn take_stream_state(
 fn put_stream_state(states: &mut ReviewStateMaps, module_id: usize, key: i64, state: ModuleState) {
     match module_id {
         0 => {
-            states.card.insert(key, state);
+            states.card.put(key, state);
         }
         1 => {
             states.deck.insert(key, state);
         }
         2 => {
-            states.note.insert(key, state);
+            states.note.put(key, state);
         }
         3 => {
             states.preset.insert(key, state);

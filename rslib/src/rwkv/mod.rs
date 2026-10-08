@@ -1,6 +1,7 @@
 // Copyright: Ankitects Pty Ltd and contributors
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
@@ -793,16 +794,28 @@ impl RwkvInference {
             .iter()
             .map(|input| self.features.features_for(input))
             .collect::<Vec<_>>();
-        let work_items = inputs
-            .iter()
-            .zip(features)
-            .map(|(input, features)| ReviewPredictionBorrowedWorkItem {
-                features,
-                state: self.warm_up_states.state_ref(input),
-            })
-            .collect::<Vec<_>>();
-
-        Ok(self.model.review_retrievability_many_borrowed(&work_items))
+        // Card and note states are kept as halves: convert them a chunk at a
+        // time, not all of a big collection's at once.
+        let mut retrievabilities = Vec::with_capacity(inputs.len());
+        for (inputs, features) in inputs
+            .chunks(STATE_VIEW_CHUNK)
+            .zip(features.chunks(STATE_VIEW_CHUNK))
+        {
+            let views = inputs
+                .par_iter()
+                .map(|input| self.warm_up_states.state_view(input))
+                .collect::<Vec<_>>();
+            let items = features
+                .iter()
+                .zip(&views)
+                .map(|(features, view)| ReviewPredictionQueryRef {
+                    features,
+                    state: view.as_ref(),
+                })
+                .collect::<Vec<_>>();
+            retrievabilities.extend(self.model.review_retrievability_query_refs(&items));
+        }
+        Ok(retrievabilities)
     }
 
     pub fn predict_retrievability_many_after_review(
@@ -1035,7 +1048,8 @@ impl RwkvInference {
             // The query and answer inputs share card/note/deck/preset ids, so
             // both passes read the same pre-review state and can run in
             // parallel; only the answer pass advances state below.
-            let state = self.warm_up_states.state_ref(&input);
+            let view = self.warm_up_states.state_view(&input);
+            let state = view.as_ref();
             let (query_retrievability, heads) = match &query_features {
                 Some(query_features) => {
                     let (retrievability, heads) = rayon::join(
@@ -1080,15 +1094,16 @@ impl RwkvInference {
             query_input.ease = None;
             query_input.duration_millis = None;
             let features = self.features.features_for(&query_input);
-            let query_heads = self
-                .model
-                .review(&features, self.warm_up_states.state_ref(&query_input));
+            let query_heads = self.model.review(
+                &features,
+                self.warm_up_states.state_view(&query_input).as_ref(),
+            );
             predictions.push(query_heads.retrievability);
 
             let features = self.features.features_for(input);
             let heads = self
                 .model
-                .review(&features, self.warm_up_states.state_ref(input));
+                .review(&features, self.warm_up_states.state_view(input).as_ref());
             self.features.store_review(input);
             self.curves.insert(input.card_id, heads.curve.clone());
             let next_state = match compression {
@@ -1298,13 +1313,14 @@ insert into segments (
     /// predictions don't change measurably.
     pub fn write_warm_up_states(&self, out: &mut impl io::Write) -> io::Result<()> {
         let states = &self.warm_up_states;
-        for map in [&states.card, &states.note, &states.deck, &states.preset] {
-            out.write_all(&(map.len() as u64).to_le_bytes())?;
-            let mut map: Vec<_> = map.iter().collect();
-            map.sort_unstable_by_key(|(id, _)| **id);
-            for (id, state) in map {
+        let maps: [&dyn StateMap; 4] = [&states.card, &states.note, &states.deck, &states.preset];
+        for map in maps {
+            out.write_all(&(map.count() as u64).to_le_bytes())?;
+            let mut ids = map.ids();
+            ids.sort_unstable();
+            for id in ids {
                 out.write_all(&id.to_le_bytes())?;
-                write_half_module_state(out, state)?;
+                write_half_module_state(out, &map.state(&id).unwrap())?;
             }
         }
         match &states.global {
@@ -1319,13 +1335,16 @@ insert into segments (
     /// Reads what [Self::write_warm_up_states] wrote, one state at a time.
     pub fn read_warm_up_states(&mut self, input: &mut impl io::Read) -> io::Result<()> {
         let mut buffer = Vec::new();
-        let mut maps: [HashMap<i64, ModuleState>; 4] = Default::default();
-        for map in &mut maps {
+        let mut card = HalfStateMap::default();
+        let mut note = HalfStateMap::default();
+        let mut deck = HashMap::new();
+        let mut preset = HashMap::new();
+        let maps: [&mut dyn StateMap; 4] = [&mut card, &mut note, &mut deck, &mut preset];
+        for map in maps {
             let count = read_u64_le(input)?;
-            map.reserve(count.min(1 << 20) as usize);
             for _ in 0..count {
                 let id = read_u64_le(input)? as i64;
-                map.insert(id, read_half_module_state(input, &mut buffer)?);
+                map.put(id, read_half_module_state(input, &mut buffer)?);
             }
         }
         let mut flag = [0_u8];
@@ -1334,7 +1353,6 @@ insert into segments (
             1 => Some(read_half_module_state(input, &mut buffer)?),
             _ => None,
         };
-        let [card, note, deck, preset] = maps;
         self.warm_up_states = ReviewStateMaps {
             card,
             note,
@@ -1941,24 +1959,44 @@ insert into segments (
         inputs: &[ReviewInput],
         states: &SimulationStates<'_>,
     ) -> Vec<RwkvWorkloadQueryPrediction> {
-        let work_items = inputs
+        let features = inputs
             .iter()
-            .map(|input| ReviewPredictionBorrowedWorkItem {
-                features: self.features.features_for(input),
-                state: states.state_ref(input),
-            })
+            .map(|input| self.features.features_for(input))
             .collect::<Vec<_>>();
         let this = &*self;
-        this.model
-            .review_many_borrowed(&work_items, |index, heads| {
-                let (current_interval, current_s90) =
-                    this.current_intervals(&inputs[index], &heads);
-                RwkvWorkloadQueryPrediction {
-                    retrievability: heads.retrievability,
-                    current_interval,
-                    current_s90,
-                }
-            })
+        let mut predictions = Vec::with_capacity(inputs.len());
+        for (chunk, (chunk_inputs, features)) in inputs
+            .chunks(STATE_VIEW_CHUNK)
+            .zip(features.chunks(STATE_VIEW_CHUNK))
+            .enumerate()
+        {
+            let views = chunk_inputs
+                .iter()
+                .map(|input| states.state_view(input))
+                .collect::<Vec<_>>();
+            let work_items = features
+                .iter()
+                .zip(&views)
+                .map(|(features, view)| ReviewPredictionBorrowedWorkItem {
+                    features: features.clone(),
+                    state: view.as_ref(),
+                })
+                .collect::<Vec<_>>();
+            let offset = chunk * STATE_VIEW_CHUNK;
+            predictions.extend(
+                this.model
+                    .review_many_borrowed(&work_items, |index, heads| {
+                        let (current_interval, current_s90) =
+                            this.current_intervals(&inputs[offset + index], &heads);
+                        RwkvWorkloadQueryPrediction {
+                            retrievability: heads.retrievability,
+                            current_interval,
+                            current_s90,
+                        }
+                    }),
+            );
+        }
+        predictions
     }
 
     fn selected_answer_intervals_for_inputs(
@@ -1973,21 +2011,43 @@ insert into segments (
             .zip(eases)
             .map(|(input, ease)| simulated_answer_input(input, *ease))
             .collect::<Vec<_>>();
-        let work_items = answer_inputs
+        let features = answer_inputs
             .iter()
-            .map(|input| ReviewPredictionBorrowedWorkItem {
-                features: self.features.features_for(input),
-                state: states.state_ref(input),
-            })
+            .map(|input| self.features.features_for(input))
             .collect::<Vec<_>>();
         let (default_retention, max_interval_days) =
             (self.target_retention, self.max_interval_days);
-        self.model
-            .review_many_borrowed(&work_items, |index, heads| {
-                let target_retention = inputs[index].target_retentions[(eases[index] - 1) as usize]
-                    .unwrap_or(default_retention);
-                interval_for_curve(&heads.curve, target_retention, max_interval_days)
-            })
+        let mut intervals = Vec::with_capacity(inputs.len());
+        for (chunk, (chunk_inputs, features)) in answer_inputs
+            .chunks(STATE_VIEW_CHUNK)
+            .zip(features.chunks(STATE_VIEW_CHUNK))
+            .enumerate()
+        {
+            let views = chunk_inputs
+                .iter()
+                .map(|input| states.state_view(input))
+                .collect::<Vec<_>>();
+            let work_items = features
+                .iter()
+                .zip(&views)
+                .map(|(features, view)| ReviewPredictionBorrowedWorkItem {
+                    features: features.clone(),
+                    state: view.as_ref(),
+                })
+                .collect::<Vec<_>>();
+            let offset = chunk * STATE_VIEW_CHUNK;
+            intervals.extend(
+                self.model
+                    .review_many_borrowed(&work_items, |index, heads| {
+                        let index = offset + index;
+                        let target_retention = inputs[index].target_retentions
+                            [(eases[index] - 1) as usize]
+                            .unwrap_or(default_retention);
+                        interval_for_curve(&heads.curve, target_retention, max_interval_days)
+                    }),
+            );
+        }
+        intervals
     }
 
     fn apply_simulation_answer(
@@ -1995,7 +2055,7 @@ insert into segments (
         input: &ReviewInput,
         states: &mut SimulationStates<'_>,
     ) -> io::Result<()> {
-        let heads = self.review_heads_for_state(input, states.state_ref(input))?;
+        let heads = self.review_heads_for_state(input, states.state_view(input).as_ref())?;
         self.features.store_review(input);
         states.store(input, heads.next_state);
         Ok(())
@@ -3331,20 +3391,6 @@ impl SrsModel {
         self.review_retrievability_query_refs(&items)
     }
 
-    fn review_retrievability_many_borrowed(
-        &self,
-        items: &[ReviewPredictionBorrowedWorkItem<'_>],
-    ) -> Vec<f32> {
-        let items = items
-            .iter()
-            .map(|item| ReviewPredictionQueryRef {
-                features: &item.features,
-                state: item.state,
-            })
-            .collect::<Vec<_>>();
-        self.review_retrievability_query_refs(&items)
-    }
-
     fn review_retrievability_query_refs(&self, items: &[ReviewPredictionQueryRef<'_>]) -> Vec<f32> {
         #[cfg(all(target_os = "macos", not(test)))]
         {
@@ -3656,6 +3702,27 @@ impl<'a> SrsStateRef<'a> {
     }
 }
 
+/// [SrsStateRef] for states that may have been converted from halves.
+struct SrsStateView<'a> {
+    card: Option<Cow<'a, ModuleState>>,
+    note: Option<Cow<'a, ModuleState>>,
+    deck: Option<&'a ModuleState>,
+    preset: Option<&'a ModuleState>,
+    global: Option<&'a ModuleState>,
+}
+
+impl SrsStateView<'_> {
+    fn as_ref(&self) -> SrsStateRef<'_> {
+        SrsStateRef {
+            card: self.card.as_deref(),
+            note: self.note.as_deref(),
+            deck: self.deck,
+            preset: self.preset,
+            global: self.global,
+        }
+    }
+}
+
 struct SrsStateOwned {
     card: Option<ModuleState>,
     deck: Option<ModuleState>,
@@ -3686,8 +3753,8 @@ struct SrsState {
 
 #[derive(Default)]
 struct ReviewStateMaps {
-    card: HashMap<i64, ModuleState>,
-    note: HashMap<i64, ModuleState>,
+    card: HalfStateMap,
+    note: HalfStateMap,
     deck: HashMap<i64, ModuleState>,
     preset: HashMap<i64, ModuleState>,
     global: Option<ModuleState>,
@@ -3739,17 +3806,16 @@ impl ReviewStateMaps {
 
     /// Approximate memory used by the states of `ids`, plus the global state.
     fn state_len_for(&self, ids: &StreamIds) -> usize {
-        [
+        let maps: [(&dyn StateMap, _); 4] = [
             (&self.card, &ids.card),
             (&self.note, &ids.note),
             (&self.deck, &ids.deck),
             (&self.preset, &ids.preset),
-        ]
-        .into_iter()
-        .flat_map(|(states, ids)| ids.iter().filter_map(|id| states.get(id)))
-        .chain(&self.global)
-        .map(serialized_module_state_len)
-        .sum()
+        ];
+        maps.into_iter()
+            .flat_map(|(states, ids)| ids.iter().filter_map(|id| states.serialized_len(id)))
+            .chain(self.global.iter().map(serialized_module_state_len))
+            .sum()
     }
 
     /// Copies the states without their checkpoint dirty-tracking.
@@ -3765,10 +3831,11 @@ impl ReviewStateMaps {
         }
     }
 
-    fn state_ref(&self, input: &ReviewInput) -> SrsStateRef<'_> {
-        SrsStateRef {
-            card: self.card.get(&input.card_id),
-            note: input.note_id.and_then(|id| self.note.get(&id)),
+    /// The states `input` reads; card and note states are converted to f32.
+    fn state_view(&self, input: &ReviewInput) -> SrsStateView<'_> {
+        SrsStateView {
+            card: self.card.state(&input.card_id),
+            note: input.note_id.and_then(|id| self.note.state(&id)),
             deck: input.deck_id.and_then(|id| self.deck.get(&id)),
             preset: input.preset_id.and_then(|id| self.preset.get(&id)),
             global: self.global.as_ref(),
@@ -3777,8 +3844,10 @@ impl ReviewStateMaps {
 
     fn state_owned(&self, input: &ReviewInput) -> SrsStateOwned {
         SrsStateOwned {
-            card: self.card.get(&input.card_id).cloned(),
-            note: input.note_id.and_then(|id| self.note.get(&id).cloned()),
+            card: self.card.state(&input.card_id).map(Cow::into_owned),
+            note: input
+                .note_id
+                .and_then(|id| self.note.state(&id).map(Cow::into_owned)),
             deck: input.deck_id.and_then(|id| self.deck.get(&id).cloned()),
             preset: input.preset_id.and_then(|id| self.preset.get(&id).cloned()),
             global: self.global.clone(),
@@ -3787,11 +3856,14 @@ impl ReviewStateMaps {
 
     fn serialized_state(&self, input: &ReviewInput) -> ReviewStateOwned {
         ReviewStateOwned {
-            card: self.card.get(&input.card_id).map(serialize_module_state),
+            card: self
+                .card
+                .state(&input.card_id)
+                .map(|s| serialize_module_state(&s)),
             note: input
                 .note_id
-                .and_then(|id| self.note.get(&id))
-                .map(serialize_module_state),
+                .and_then(|id| self.note.state(&id))
+                .map(|s| serialize_module_state(&s)),
             deck: input
                 .deck_id
                 .and_then(|id| self.deck.get(&id))
@@ -3814,7 +3886,7 @@ impl ReviewStateMaps {
             card: if query.card_id == answer.card_id {
                 Some(next_state.card.clone())
             } else {
-                self.card.get(&query.card_id).cloned()
+                self.card.state(&query.card_id).map(Cow::into_owned)
             },
             note: branched_optional_module_state(
                 &self.note,
@@ -3839,10 +3911,10 @@ impl ReviewStateMaps {
     }
 
     fn store(&mut self, input: &ReviewInput, state: SrsState) {
-        self.card.insert(input.card_id, state.card);
+        self.card.put(input.card_id, state.card);
         self.mark_dirty(input);
         if let Some(note_id) = input.note_id {
-            self.note.insert(note_id, state.note);
+            self.note.put(note_id, state.note);
         }
         if let Some(deck_id) = input.deck_id {
             self.deck.insert(deck_id, state.deck);
@@ -3898,12 +3970,13 @@ impl ReviewStateMaps {
 
     fn checkpoint_delta_len(&self, full: bool) -> io::Result<usize> {
         let mut len = STATE_CACHE_DELTA_MAGIC.len();
-        for (states, dirty) in [
+        let maps: [(&dyn StateMap, _); 4] = [
             (&self.card, &self.dirty_card),
             (&self.note, &self.dirty_note),
             (&self.deck, &self.dirty_deck),
             (&self.preset, &self.dirty_preset),
-        ] {
+        ];
+        for (states, dirty) in maps {
             len = len
                 .checked_add(state_cache_map_delta_len(states, dirty, full)?)
                 .ok_or_else(state_cache_delta_too_large)?;
@@ -3921,12 +3994,13 @@ impl ReviewStateMaps {
 
     fn write_checkpoint_delta(&self, out: &mut impl io::Write, full: bool) -> io::Result<()> {
         out.write_all(STATE_CACHE_DELTA_MAGIC)?;
-        for (states, dirty) in [
+        let maps: [(&dyn StateMap, _); 4] = [
             (&self.card, &self.dirty_card),
             (&self.note, &self.dirty_note),
             (&self.deck, &self.dirty_deck),
             (&self.preset, &self.dirty_preset),
-        ] {
+        ];
+        for (states, dirty) in maps {
             write_state_cache_map_delta(out, states, dirty, full)?;
         }
         if !full && !self.global_dirty {
@@ -3942,12 +4016,12 @@ impl ReviewStateMaps {
 }
 
 fn state_cache_delta_identities(
-    states: &HashMap<i64, ModuleState>,
+    states: &dyn StateMap,
     dirty: &HashSet<i64>,
     full: bool,
 ) -> Vec<i64> {
     let mut identities = if full {
-        states.keys().copied().collect::<Vec<_>>()
+        states.ids()
     } else {
         dirty.iter().copied().collect::<Vec<_>>()
     };
@@ -3956,7 +4030,7 @@ fn state_cache_delta_identities(
 }
 
 fn state_cache_map_delta_len(
-    states: &HashMap<i64, ModuleState>,
+    states: &dyn StateMap,
     dirty: &HashSet<i64>,
     full: bool,
 ) -> io::Result<usize> {
@@ -3964,9 +4038,9 @@ fn state_cache_map_delta_len(
     let mut len = 4_usize;
     for identity in identities {
         len = len.checked_add(9).ok_or_else(state_cache_delta_too_large)?;
-        if let Some(state) = states.get(&identity) {
+        if let Some(state_len) = states.serialized_len(&identity) {
             len = len
-                .checked_add(4 + serialized_module_state_len(state))
+                .checked_add(4 + state_len)
                 .ok_or_else(state_cache_delta_too_large)?;
         }
     }
@@ -3975,7 +4049,7 @@ fn state_cache_map_delta_len(
 
 fn write_state_cache_map_delta(
     out: &mut impl io::Write,
-    states: &HashMap<i64, ModuleState>,
+    states: &dyn StateMap,
     dirty: &HashSet<i64>,
     full: bool,
 ) -> io::Result<()> {
@@ -3983,9 +4057,9 @@ fn write_state_cache_map_delta(
     write_snapshot_u32(out, identities.len())?;
     for identity in identities {
         out.write_all(&identity.to_le_bytes())?;
-        if let Some(state) = states.get(&identity) {
+        if let Some(state) = states.state(&identity) {
             out.write_all(&[1])?;
-            write_snapshot_module_state(out, state)?;
+            write_snapshot_module_state(out, &state)?;
         } else {
             out.write_all(&[0])?;
         }
@@ -3998,20 +4072,20 @@ fn state_cache_delta_too_large() -> io::Error {
 }
 
 fn restore_serialized_state(
-    states: &mut HashMap<i64, ModuleState>,
+    states: &mut dyn StateMap,
     id: i64,
     state: Option<&[u8]>,
 ) -> io::Result<()> {
     if let Some(state) = deserialize_module_state(state)? {
-        states.insert(id, state);
+        states.put(id, state);
     } else {
-        states.remove(&id);
+        states.take(&id);
     }
     Ok(())
 }
 
 fn restore_optional_serialized_state(
-    states: &mut HashMap<i64, ModuleState>,
+    states: &mut dyn StateMap,
     id: Option<i64>,
     state: Option<&[u8]>,
 ) -> io::Result<()> {
@@ -4022,14 +4096,14 @@ fn restore_optional_serialized_state(
 }
 
 fn branched_optional_module_state(
-    map: &HashMap<i64, ModuleState>,
+    map: &dyn StateMap,
     query_id: Option<i64>,
     answer_id: Option<i64>,
     next_state: &ModuleState,
 ) -> Option<ModuleState> {
     match query_id {
         Some(id) if Some(id) == answer_id => Some(next_state.clone()),
-        Some(id) => map.get(&id).cloned(),
+        Some(id) => map.state(&id).map(Cow::into_owned),
         None => None,
     }
 }
@@ -4081,7 +4155,7 @@ impl<'a> SimulationStates<'a> {
         }
     }
 
-    fn state_ref(&self, input: &ReviewInput) -> SrsStateRef<'_> {
+    fn state_view(&self, input: &ReviewInput) -> SrsStateView<'_> {
         fn lookup<'s>(
             own: &'s HashMap<i64, ModuleState>,
             base: &'s HashMap<i64, ModuleState>,
@@ -4089,11 +4163,18 @@ impl<'a> SimulationStates<'a> {
         ) -> Option<&'s ModuleState> {
             own.get(&id).or_else(|| base.get(&id))
         }
-        SrsStateRef {
-            card: lookup(&self.card, &self.base.card, input.card_id),
+        fn lookup_half<'s>(
+            own: &'s HashMap<i64, ModuleState>,
+            base: &'s HalfStateMap,
+            id: i64,
+        ) -> Option<Cow<'s, ModuleState>> {
+            own.get(&id).map(Cow::Borrowed).or_else(|| base.state(&id))
+        }
+        SrsStateView {
+            card: lookup_half(&self.card, &self.base.card, input.card_id),
             note: input
                 .note_id
-                .and_then(|id| lookup(&self.note, &self.base.note, id)),
+                .and_then(|id| lookup_half(&self.note, &self.base.note, id)),
             deck: input
                 .deck_id
                 .and_then(|id| lookup(&self.deck, &self.base.deck, id)),
@@ -4119,37 +4200,38 @@ impl<'a> SimulationStates<'a> {
     }
 }
 
-fn deserialize_state_map_subset(
+fn deserialize_state_map_subset<M: StateMap + Default>(
     states: &[(i64, Vec<u8>)],
     ids: &HashSet<i64>,
-) -> io::Result<HashMap<i64, ModuleState>> {
-    let mut map = HashMap::with_capacity(ids.len());
+) -> io::Result<M> {
+    let mut map = M::default();
     for (key, state) in states {
         if !ids.contains(key) {
             continue;
         }
         if let Some(state) = deserialize_module_state(Some(state.as_slice()))? {
-            map.insert(*key, state);
+            map.put(*key, state);
         }
     }
     Ok(map)
 }
 
-fn deserialize_state_map(states: &[(i64, Vec<u8>)]) -> io::Result<HashMap<i64, ModuleState>> {
-    let mut map = HashMap::with_capacity(states.len());
+fn deserialize_state_map<M: StateMap + Default>(states: &[(i64, Vec<u8>)]) -> io::Result<M> {
+    let mut map = M::default();
     for (key, state) in states {
         let Some(state) = deserialize_module_state(Some(state.as_slice()))? else {
             continue;
         };
-        map.insert(*key, state);
+        map.put(*key, state);
     }
     Ok(map)
 }
 
-fn serialize_state_map(states: &HashMap<i64, ModuleState>) -> Vec<(i64, Vec<u8>)> {
+fn serialize_state_map(states: &dyn StateMap) -> Vec<(i64, Vec<u8>)> {
     let mut states: Vec<_> = states
-        .iter()
-        .map(|(key, state)| (*key, serialize_module_state(state)))
+        .ids()
+        .into_iter()
+        .map(|key| (key, serialize_module_state(&states.state(&key).unwrap())))
         .collect();
     states.sort_by_key(|(key, _)| *key);
     states
@@ -4349,16 +4431,13 @@ fn write_snapshot_module_state(out: &mut impl io::Write, state: &ModuleState) ->
     write_serialized_module_state(out, state)
 }
 
-fn write_snapshot_state_map(
-    out: &mut impl io::Write,
-    states: &HashMap<i64, ModuleState>,
-) -> io::Result<()> {
-    write_snapshot_u32(out, states.len())?;
-    let mut states = states.iter().collect::<Vec<_>>();
-    states.sort_unstable_by_key(|(identity, _)| **identity);
-    for (identity, state) in states {
+fn write_snapshot_state_map(out: &mut impl io::Write, states: &dyn StateMap) -> io::Result<()> {
+    write_snapshot_u32(out, states.count())?;
+    let mut identities = states.ids();
+    identities.sort_unstable();
+    for identity in identities {
         out.write_all(&identity.to_le_bytes())?;
-        write_snapshot_module_state(out, state)?;
+        write_snapshot_module_state(out, &states.state(&identity).unwrap())?;
     }
     Ok(())
 }
@@ -4800,12 +4879,13 @@ fn read_state_cache_maps(
                 "invalid RWKV state-cache delta header",
             ));
         }
-        for (states, seen) in [
+        let maps: [(&mut dyn StateMap, _); 4] = [
             (&mut result.card, &mut seen_card),
             (&mut result.note, &mut seen_note),
             (&mut result.deck, &mut seen_deck),
             (&mut result.preset, &mut seen_preset),
-        ] {
+        ];
+        for (states, seen) in maps {
             read_state_cache_map_delta(&mut state_delta, states, seen, &mut state_bytes)?;
         }
         match read_state_cache_u8(&mut state_delta)? {
@@ -4841,7 +4921,7 @@ fn read_state_cache_maps(
 
 fn read_state_cache_map_delta(
     input: &mut (impl io::Read + io::Seek),
-    states: &mut HashMap<i64, ModuleState>,
+    states: &mut dyn StateMap,
     seen: &mut HashSet<i64>,
     state_bytes: &mut Vec<u8>,
 ) -> io::Result<()> {
@@ -4855,7 +4935,7 @@ fn read_state_cache_map_delta(
                 let size = read_state_cache_u32(input)?;
                 if seen.insert(identity) {
                     if let Some(state) = read_state_cache_module_state(input, size, state_bytes)? {
-                        states.insert(identity, state);
+                        states.put(identity, state);
                     }
                 } else {
                     // A newer segment already provided this state.
@@ -5559,6 +5639,166 @@ impl RwkvLayer {
             out,
             &mut scratch.channel,
         );
+    }
+}
+
+/// Card and note states as 16-bit floats (kuma3). A big collection holds tens
+/// of thousands: about 90 KB each as f32, 1.3 GB for a 22k-card collection on
+/// a phone, where Android then kills other apps. A state is converted to f32
+/// only while a review or query uses it. Deck, preset and global states are
+/// few but change with every review, so they stay f32. Card states rounded to
+/// halves after each review gave the same log loss and RMSE in the fork's
+/// state compression metric.
+#[derive(Clone, Default)]
+struct HalfStateMap(HashMap<i64, HalfModuleState>);
+
+#[derive(Clone)]
+struct HalfModuleState {
+    /// Per layer, the lengths of the time-mix shift, time-mix matrix and
+    /// channel-mix shift (`ABSENT`: no such part).
+    lens: Box<[[u32; 3]]>,
+    values: Box<[half::f16]>,
+}
+
+const ABSENT: u32 = u32::MAX;
+
+/// Queries converted from half states at a time (see [HalfStateMap]): about
+/// 90 MB of f32 states.
+const STATE_VIEW_CHUNK: usize = 512;
+
+impl HalfModuleState {
+    fn new(state: &ModuleState) -> Self {
+        use half::slice::HalfFloatSliceExt;
+        fn parts(layer: &LayerState) -> [Option<&[f32]>; 3] {
+            let time = layer.time.as_ref();
+            [
+                time.map(|time| time.x_shift.as_slice()),
+                time.map(|time| time.matrix.as_slice()),
+                layer.channel_shift.as_deref(),
+            ]
+        }
+        let lens: Box<[[u32; 3]]> = state
+            .layers
+            .iter()
+            .map(|layer| parts(layer).map(|part| part.map_or(ABSENT, |p| p.len() as u32)))
+            .collect();
+        let total = lens
+            .iter()
+            .flatten()
+            .filter(|&&len| len != ABSENT)
+            .sum::<u32>();
+        let mut values = vec![half::f16::ZERO; total as usize].into_boxed_slice();
+        let mut at = 0;
+        for part in state.layers.iter().flat_map(parts).flatten() {
+            values[at..at + part.len()].convert_from_f32_slice(part);
+            at += part.len();
+        }
+        Self { lens, values }
+    }
+
+    fn to_module_state(&self) -> ModuleState {
+        use half::slice::HalfFloatSliceExt;
+        let mut at = 0;
+        let mut take = |len: u32| {
+            (len != ABSENT).then(|| {
+                let part = self.values[at..at + len as usize].to_f32_vec();
+                at += len as usize;
+                part
+            })
+        };
+        ModuleState {
+            layers: self
+                .lens
+                .iter()
+                .map(|&[x_shift, matrix, channel]| {
+                    let x_shift = take(x_shift);
+                    let matrix = take(matrix);
+                    LayerState {
+                        time: x_shift
+                            .zip(matrix)
+                            .map(|(x_shift, matrix)| TimeState { x_shift, matrix }),
+                        channel_shift: take(channel),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// The length [serialize_module_state] gives the f32 state.
+    fn serialized_len(&self) -> usize {
+        b"ARWKVMODSTATE1".len() + 4 + self.lens.len() * 12 + 4 * self.values.len()
+    }
+}
+
+/// What the state helpers need from a map of states, f32 or half.
+trait StateMap {
+    fn state(&self, id: &i64) -> Option<Cow<'_, ModuleState>>;
+    fn put(&mut self, id: i64, state: ModuleState);
+    fn take(&mut self, id: &i64) -> Option<ModuleState>;
+    fn ids(&self) -> Vec<i64>;
+    fn count(&self) -> usize;
+    /// The length [serialize_module_state] gives the state.
+    fn serialized_len(&self, id: &i64) -> Option<usize>;
+}
+
+impl StateMap for HashMap<i64, ModuleState> {
+    fn state(&self, id: &i64) -> Option<Cow<'_, ModuleState>> {
+        self.get(id).map(Cow::Borrowed)
+    }
+    fn put(&mut self, id: i64, state: ModuleState) {
+        self.insert(id, state);
+    }
+    fn take(&mut self, id: &i64) -> Option<ModuleState> {
+        self.remove(id)
+    }
+    fn ids(&self) -> Vec<i64> {
+        self.keys().copied().collect()
+    }
+    fn count(&self) -> usize {
+        self.len()
+    }
+    fn serialized_len(&self, id: &i64) -> Option<usize> {
+        self.get(id).map(serialized_module_state_len)
+    }
+}
+
+impl StateMap for HalfStateMap {
+    fn state(&self, id: &i64) -> Option<Cow<'_, ModuleState>> {
+        self.0
+            .get(id)
+            .map(|state| Cow::Owned(state.to_module_state()))
+    }
+    fn put(&mut self, id: i64, state: ModuleState) {
+        self.0.insert(id, HalfModuleState::new(&state));
+    }
+    fn take(&mut self, id: &i64) -> Option<ModuleState> {
+        self.0.remove(id).map(|state| state.to_module_state())
+    }
+    fn ids(&self) -> Vec<i64> {
+        self.0.keys().copied().collect()
+    }
+    fn count(&self) -> usize {
+        self.0.len()
+    }
+    fn serialized_len(&self, id: &i64) -> Option<usize> {
+        self.0.get(id).map(HalfModuleState::serialized_len)
+    }
+}
+
+impl HalfStateMap {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl FromIterator<(i64, ModuleState)> for HalfStateMap {
+    fn from_iter<T: IntoIterator<Item = (i64, ModuleState)>>(iter: T) -> Self {
+        Self(
+            iter.into_iter()
+                .map(|(id, state)| (id, HalfModuleState::new(&state)))
+                .collect(),
+        )
     }
 }
 
@@ -9735,6 +9975,71 @@ order by e.id, e.cid
         );
     }
 
+    /// Bulk and per-review replays round card and note states to halves at
+    /// different points (after each chunk vs after each review, see
+    /// [HalfStateMap]), so they agree only to about that precision.
+    fn assert_warm_up_close(sequential: &RwkvInference, bulk: &RwkvInference) {
+        fn values(state: &[u8]) -> Vec<f32> {
+            deserialize_module_state(Some(state))
+                .unwrap()
+                .unwrap()
+                .layers
+                .into_iter()
+                .flat_map(|layer| {
+                    let time = layer.time.map_or_else(Vec::new, |time| {
+                        time.x_shift.into_iter().chain(time.matrix).collect()
+                    });
+                    time.into_iter()
+                        .chain(layer.channel_shift.unwrap_or_default())
+                })
+                .collect()
+        }
+        fn close(label: &str, a: &[f32], b: &[f32]) {
+            assert_eq!(a.len(), b.len(), "{label} sizes diverged");
+            let worst = a
+                .iter()
+                .zip(b)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            assert!(worst <= STATE_TOLERANCE, "{label} diverged by {worst}");
+        }
+        let a = sequential.warm_up_snapshot();
+        let b = bulk.warm_up_snapshot();
+        for (label, a, b) in [
+            ("card", a.card_states, b.card_states),
+            ("note", a.note_states, b.note_states),
+            ("deck", a.deck_states, b.deck_states),
+            ("preset", a.preset_states, b.preset_states),
+        ] {
+            let (a, b) = (sorted_states(a), sorted_states(b));
+            assert_eq!(
+                a.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                b.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                "{label} ids diverged"
+            );
+            for ((id, a), (_, b)) in a.iter().zip(&b) {
+                close(&format!("{label} {id} state"), &values(a), &values(b));
+            }
+        }
+        close(
+            "global state",
+            &values(a.global_state.as_deref().unwrap()),
+            &values(b.global_state.as_deref().unwrap()),
+        );
+        let mut ids: Vec<_> = sequential.curves.keys().copied().collect();
+        ids.sort_unstable();
+        assert_eq!(ids.len(), bulk.curves.len(), "curves diverged");
+        for id in ids {
+            let (a, b) = (&sequential.curves[&id], &bulk.curves[&id]);
+            close("curve logits", &a.ahead_logits, &b.ahead_logits);
+            close("curve weights", &a.weights, &b.weights);
+        }
+    }
+
+    /// See [assert_warm_up_close].
+    const STATE_TOLERANCE: f32 = 0.01;
+    const PREDICTION_TOLERANCE: f32 = 1e-3;
+
     fn assert_prediction_parity(sequential: &[(usize, f32)], bulk: &[(usize, f32)]) {
         assert_eq!(sequential.len(), bulk.len(), "prediction counts diverged");
         for ((sequential_index, sequential_value), (bulk_index, bulk_value)) in
@@ -9792,17 +10097,21 @@ order by e.id, e.cid
             let bulk_predictions =
                 bulk::warm_up_reviews_bulk(&mut bulk, reviews.clone(), record_predictions).unwrap();
 
-            assert_prediction_close(&sequential_predictions, &bulk_predictions, 1e-5);
+            assert_prediction_close(
+                &sequential_predictions,
+                &bulk_predictions,
+                PREDICTION_TOLERANCE,
+            );
             if record_predictions {
                 let sequential_log_loss = prediction_log_loss(&sequential_predictions, &reviews);
                 let bulk_log_loss = prediction_log_loss(&bulk_predictions, &reviews);
                 let log_loss_delta = (bulk_log_loss - sequential_log_loss).abs();
                 assert!(
-                    log_loss_delta <= 1e-7,
+                    log_loss_delta <= 1e-4,
                     "logloss changed: before={sequential_log_loss:.15}, after={bulk_log_loss:.15}, delta={log_loss_delta:.15}"
                 );
             }
-            assert_warm_up_parity(&sequential, &bulk);
+            assert_warm_up_close(&sequential, &bulk);
             assert_eq!(
                 sequential.cache_state().len(),
                 bulk.cache_state().len(),
@@ -10202,8 +10511,12 @@ order by e.id, e.cid
             offset += call;
         }
 
-        assert_prediction_parity(&sequential_predictions, &bulk_predictions);
-        assert_warm_up_parity(&sequential, &bulk);
+        assert_prediction_close(
+            &sequential_predictions,
+            &bulk_predictions,
+            PREDICTION_TOLERANCE,
+        );
+        assert_warm_up_close(&sequential, &bulk);
     }
 
     #[test]
@@ -10233,8 +10546,7 @@ order by e.id, e.cid
             offset += call;
         }
 
-        assert_warm_up_parity(&sequential, &wavefront);
-        assert_eq!(sequential.cache_state(), wavefront.cache_state());
+        assert_warm_up_close(&sequential, &wavefront);
     }
 
     #[test]
@@ -10580,12 +10892,16 @@ order by e.id, e.cid
             .iter()
             .map(|input| inference.features.features_for(input))
             .collect::<Vec<_>>();
-        let items = inputs
+        let views = inputs
+            .iter()
+            .map(|input| inference.warm_up_states.state_view(input))
+            .collect::<Vec<_>>();
+        let items = views
             .iter()
             .zip(&features)
-            .map(|(input, features)| ReviewPredictionQueryRef {
+            .map(|(view, features)| ReviewPredictionQueryRef {
                 features,
-                state: inference.warm_up_states.state_ref(input),
+                state: view.as_ref(),
             })
             .collect::<Vec<_>>();
 
@@ -10827,11 +11143,11 @@ order by e.id, e.cid
             .unwrap();
 
         assert_eq!(
-            serialize_module_state(states.card.get(&1).unwrap()),
+            serialize_module_state(&states.card.state(&1).unwrap()),
             serialized
         );
         assert_eq!(
-            serialize_module_state(states.note.get(&2).unwrap()),
+            serialize_module_state(&states.note.state(&2).unwrap()),
             serialized
         );
         assert_eq!(
