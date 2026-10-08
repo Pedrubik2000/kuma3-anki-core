@@ -689,13 +689,15 @@ impl SqliteStorage {
         &self,
         ignored_review_ids: &[RevlogId],
     ) -> Result<(Vec<RwkvHistoricalReviewRow>, Vec<i64>)> {
-        self.rwkv_historical_review_rows_with_cutoffs(ignored_review_ids, &HashMap::new())
+        self.rwkv_historical_review_rows_with_cutoffs(ignored_review_ids, &HashMap::new(), None)
     }
 
     pub(crate) fn rwkv_historical_review_rows_with_cutoffs(
         &self,
         ignored_review_ids: &[RevlogId],
         preserved_learning_start_cutoffs: &HashMap<i64, i64>,
+        // Only this card's reviews (what is kept of a card depends only on its own).
+        card_id: Option<CardId>,
     ) -> Result<(Vec<RwkvHistoricalReviewRow>, Vec<i64>)> {
         let (ignored_clause, active_ignored_review_ids) = if ignored_review_ids.is_empty() {
             (String::new(), Vec::new())
@@ -719,6 +721,7 @@ impl SqliteStorage {
                 .collect::<std::result::Result<Vec<i64>, _>>()?;
             (format!("and r.id not in {ids}"), active)
         };
+        let card_clause = card_id.map_or(String::new(), |id| format!("and r.cid = {}", id.0));
         // Rows come back in rowid (review id) order, so no sort or window
         // function is needed; the per-card replay start is derived below.
         let sql = format!(
@@ -738,6 +741,7 @@ where r.ease between 1 and 4
   and r.type in (0, 1, 2, 3, 4, 5)
   and not (r.type = 3 and r.factor = 0)
   {ignored_clause}
+  {card_clause}
 order by r.id"
         );
         let mut rows = self

@@ -80,6 +80,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     let after_rebuild = all_scores(&mut col)?;
+    report(
+        "before rebuild vs after rebuild (no answers)",
+        &before_rebuild,
+        &after_rebuild,
+    );
     let status = SchedulerService::rwkv_offline_instant_pass_step(
         &mut col,
         RwkvOfflineInstantPassStepRequest {
@@ -243,6 +248,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("wrote {} scores to {path}", scores.len());
     }
 
+    if args.get(4).map(String::as_str) == Some("lag") {
+        let deck: i64 = args[5].parse()?;
+        return lag_check(col, deck, now);
+    }
     if args.get(4).map(String::as_str) == Some("answer") {
         answer_check(col, &args[1], &args[2], now)?;
     }
@@ -309,6 +318,17 @@ fn answer_check(
     )?;
     DecksService::deck_tree(&mut col, DeckTreeRequest { now })?;
     let incremental = all_scores(&mut col)?;
+    std::thread::sleep(std::time::Duration::from_secs(20));
+    SchedulerService::rwkv_offline_instant_pass_step(
+        &mut col,
+        RwkvOfflineInstantPassStepRequest::default(),
+    )?;
+    DecksService::deck_tree(&mut col, DeckTreeRequest { now })?;
+    report(
+        "incremental vs itself 20 s later",
+        &incremental,
+        &all_scores(&mut col)?,
+    );
     println!(
         "answered {answered:?}; rescored {} cards in {} ms",
         pass.scored,
@@ -340,20 +360,8 @@ fn answer_check(
         )?;
         DecksService::deck_tree(&mut col, DeckTreeRequest { now })?;
         let other = all_scores(&mut col)?;
-        let max_diff = incremental
-            .iter()
-            .zip(&other)
-            .map(|((a_id, a), (b_id, b))| {
-                assert_eq!(a_id, b_id);
-                (a - b).abs()
-            })
-            .fold(0.0f32, f32::max);
-        println!(
-            "{label}: {} reviews replayed, {} scores, incremental {} scores, max difference {max_diff:.6}",
-            prepared.reviews_replayed,
-            other.len(),
-            incremental.len()
-        );
+        println!("{label}: {} reviews replayed", prepared.reviews_replayed);
+        report(&format!("incremental vs {label}"), &incremental, &other);
         col.close(None)?;
     }
     Ok(())
@@ -378,4 +386,93 @@ fn prepare_and_wait(
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     Ok(prepared)
+}
+
+/// How many cards differ between two score lists, and the worst ones.
+fn report(label: &str, a: &[(i64, f32)], b: &[(i64, f32)]) {
+    assert_eq!(a.len(), b.len());
+    let mut diffs: Vec<(f32, i64, f32, f32)> = a
+        .iter()
+        .zip(b)
+        .map(|((a_id, a), (b_id, b))| {
+            assert_eq!(a_id, b_id);
+            ((a - b).abs(), *a_id, *a, *b)
+        })
+        .collect();
+    diffs.sort_by(|x, y| y.0.total_cmp(&x.0));
+    let over = |t: f32| diffs.iter().filter(|d| d.0 > t).count();
+    println!(
+        "{label}: {} cards; max {:.6}; over 0.0001: {}, 0.001: {}, 0.01: {}, 0.05: {}",
+        diffs.len(),
+        diffs[0].0,
+        over(0.0001),
+        over(0.001),
+        over(0.01),
+        over(0.05)
+    );
+    for (diff, cid, a, b) in diffs.iter().take(12).filter(|d| d.0 > 0.001) {
+        println!("  WORST {cid} {a:.4} {b:.4} diff {diff:.4}");
+    }
+}
+
+/// Review 30 cards of `deck` (Good) the way the app does, timing the fetch of
+/// the next card and the answer separately.
+fn lag_check(
+    mut col: anki::collection::Collection,
+    deck: i64,
+    now: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    col.set_current_deck(anki::decks::DeckId(deck))?;
+    {
+        let config_id = col
+            .get_deck(anki::decks::DeckId(deck))?
+            .unwrap()
+            .config_id()
+            .unwrap();
+        let config = col.get_deck_config(config_id, false)?.unwrap();
+        println!(
+            "LAG preset {}: instant {} refresh_interval {} candidate_refresh {} batch {}",
+            config.name,
+            config.inner.rwkv_review_instant_order_enabled,
+            config.inner.rwkv_review_refresh_interval,
+            config.inner.rwkv_review_candidate_refresh_enabled,
+            config.inner.rwkv_review_batch_size
+        );
+    }
+    let request = anki_proto::scheduler::GetQueuedCardsRequest {
+        fetch_limit: 1,
+        ..Default::default()
+    };
+    for index in 0..30 {
+        let start = Instant::now();
+        let queued = SchedulerService::get_queued_cards(&mut col, request.clone())?;
+        let fetch_ms = start.elapsed().as_millis();
+        let Some(card) = queued.cards.first() else {
+            break;
+        };
+        let card_id = card.card.as_ref().unwrap().id;
+        let states = card.states.clone().unwrap();
+        let start = Instant::now();
+        SchedulerService::answer_card(
+            &mut col,
+            anki_proto::scheduler::CardAnswer {
+                card_id,
+                current_state: states.current.clone(),
+                new_state: states.good.clone(),
+                rating: 2,
+                answered_at_millis: (now + index) * 1000,
+                milliseconds_taken: 5_000,
+                ..Default::default()
+            },
+        )?;
+        println!(
+            "LAG card {index}: fetch {fetch_ms} ms, answer {} ms (queue {})",
+            start.elapsed().as_millis(),
+            card.queue
+        );
+    }
+    let start = Instant::now();
+    DecksService::deck_tree(&mut col, DeckTreeRequest { now: now + 30 })?;
+    println!("LAG deck list after: {} ms", start.elapsed().as_millis());
+    Ok(())
 }

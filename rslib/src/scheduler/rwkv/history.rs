@@ -25,31 +25,11 @@ impl Collection {
                 preserved_learning_start_cutoffs: input.preserved_learning_start_cutoffs,
                 first_review_uses_creation: input.first_review_uses_creation,
                 recovery_checkpoint_max_age_millis: input.recovery_checkpoint_max_age_millis,
+                card_id: None,
             },
             |review, hash, is_checkpoint| {
                 let row = review.row;
-                output.reviews.push(Review {
-                    review_id: row.review_id,
-                    card_id: row.card_id,
-                    note_id: row.note_id,
-                    deck_id: row.deck_id,
-                    preset_id: review.stable_preset_id,
-                    ease: row.ease,
-                    duration_millis: row.duration_millis,
-                    review_kind: row.review_kind,
-                    interval_days: row.interval_days,
-                    ease_factor: row.ease_factor,
-                    // The desktop's legacy card_type field holds RwkvReviewState:
-                    // zero marks learning start; other states are revlog kind + 1.
-                    card_type: if row.is_learning_start {
-                        0
-                    } else {
-                        row.review_kind + 1
-                    },
-                    day_offset: review.day_offset,
-                    elapsed_days: review.elapsed_days,
-                    elapsed_seconds: review.elapsed_seconds,
-                });
+                output.reviews.push(historical_review(&review));
                 metadata
                     .previous_review_id_by_card
                     .insert(row.card_id, row.review_id);
@@ -81,6 +61,82 @@ impl Collection {
         output.metadata = Some(metadata);
         output.active_ignored_review_ids = fingerprint.active_ignored_review_ids;
         Ok(output)
+    }
+}
+
+fn historical_review(review: &RwkvHistoricalFingerprintReview) -> Review {
+    let row = review.row;
+    Review {
+        review_id: row.review_id,
+        card_id: row.card_id,
+        note_id: row.note_id,
+        deck_id: row.deck_id,
+        preset_id: review.stable_preset_id,
+        ease: row.ease,
+        duration_millis: row.duration_millis,
+        review_kind: row.review_kind,
+        interval_days: row.interval_days,
+        ease_factor: row.ease_factor,
+        // The desktop's legacy card_type field holds RwkvReviewState:
+        // zero marks learning start; other states are revlog kind + 1.
+        card_type: if row.is_learning_start {
+            0
+        } else {
+            row.review_kind + 1
+        },
+        day_offset: review.day_offset,
+        elapsed_days: review.elapsed_days,
+        elapsed_seconds: review.elapsed_seconds,
+    }
+}
+
+impl Collection {
+    /// The newest of `card_id`'s reviews as the history replay sees it, and
+    /// how the history identity `identity` reads once it is appended. None
+    /// when appending isn't the same as a full replay: the review isn't newer
+    /// than `identity`, or it restarted the card's learning history, which
+    /// drops the card's earlier reviews from the history.
+    pub(super) fn rwkv_historical_review_appended(
+        &mut self,
+        card_id: CardId,
+        identity: &RwkvHistoricalReviewIdentity,
+        history: RwkvHistoricalReviewFingerprintRequest,
+    ) -> Result<Option<(Review, RwkvHistoricalReviewIdentity)>> {
+        let mut newest = None;
+        let _ = self.visit_rwkv_historical_reviews(
+            history,
+            RwkvHistoricalReplayOptions {
+                card_id: Some(card_id),
+                ..Default::default()
+            },
+            |review, _, _| newest = Some(review),
+        )?;
+        let Some(review) = newest.filter(|r| r.row.review_id > identity.last_review_id) else {
+            return Ok(None);
+        };
+        if review.row.is_learning_start {
+            let earlier: i64 = self.storage.db.query_row(
+                "select count() from revlog where cid = ? and id < ?
+                   and ease between 1 and 4 and type in (0, 1, 2, 3, 4, 5)
+                   and not (type = 3 and factor = 0)",
+                [card_id.0, review.row.review_id],
+                |row| row.get(0),
+            )?;
+            if earlier > 0 {
+                return Ok(None);
+            }
+        }
+        let Ok(previous) =
+            <[u8; 32]>::try_from(hex::decode(&identity.history_hash).unwrap_or_default())
+        else {
+            return Ok(None);
+        };
+        let identity = RwkvHistoricalReviewIdentity {
+            last_review_id: review.row.review_id,
+            review_count: identity.review_count + 1,
+            history_hash: rwkv_history_hash_hex(rwkv_history_hash_after_review(previous, &review)),
+        };
+        Ok(Some((historical_review(&review), identity)))
     }
 }
 

@@ -28,6 +28,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use anki_proto::deck_config::deck_config::config::NewCardGatherPriority;
+use anki_proto::deck_config::deck_config::config::ReviewCardOrder;
 use anki_proto::scheduler::rwkv_historical_review_inputs_response::Review;
 use anki_proto::scheduler::rwkv_offline_forecast_response::Card as ForecastCard;
 use anki_proto::scheduler::rwkv_review_input_rows_for_cards_response::Row;
@@ -39,6 +40,7 @@ use anki_proto::scheduler::RwkvOfflineInstantPassProgress;
 use anki_proto::scheduler::RwkvOfflineInstantPassStepRequest;
 use anki_proto::scheduler::RwkvPrepareOfflineRequest;
 use anki_proto::scheduler::RwkvPrepareOfflineResponse;
+use anki_proto::scheduler::RwkvReviewInputRowsForCardsRequest;
 use prost::Message;
 use rusqlite::OptionalExtension;
 
@@ -60,6 +62,11 @@ const DEFAULT_TARGET_RETENTION: f32 = 0.9;
 /// recomputed once they are this old, even when no review happened.
 const QUEUE_SCORE_MAX_AGE_SECS: i64 = 30;
 const DECK_COUNT_SCORE_MAX_AGE_SECS: i64 = 120;
+/// The desktop's default and bounds for `rwkv_review_batch_size`, the number of
+/// cards a "faster, approximate" queue update rechecks.
+const DEFAULT_REVIEW_BATCH_SIZE: u32 = 512;
+const MIN_REVIEW_BATCH_SIZE: u32 = 64;
+const MAX_REVIEW_BATCH_SIZE: u32 = 8192;
 /// The state file is rewritten after a full replay, and otherwise once this
 /// many reviews were absorbed since it was written (a start replays at most
 /// these few).
@@ -124,6 +131,9 @@ struct ScopeScores {
     days_elapsed: u32,
     computed_at: TimestampSecs,
     cards: Vec<ScoredCard>,
+    /// Cards answered since the last update of the whole scope (or of its
+    /// candidates): their scores are older than their answer.
+    answered: Vec<CardId>,
 }
 
 #[derive(Clone, Copy)]
@@ -204,13 +214,23 @@ impl RwkvOfflineRuntime {
             self.reset()?;
         }
         let replayed = plan.reviews.len() as u64;
+        let answered: Vec<_> = plan.reviews.iter().map(|r| CardId(r.card_id)).collect();
         // The identity is cleared first so a failed replay forces a rebuild.
         self.identity = None;
         self.inference.warm_up_reviews(plan.reviews, false)?;
         let review_count = plan.identity.review_count;
         self.identity = Some(plan.identity);
         self.checked_at_mod = Some(plan.collection_mod);
-        self.state_changed();
+        if plan.reset {
+            self.state_changed();
+        } else {
+            // Scores are kept: a queue update may refresh only some of them
+            // (`rwkv_offline_scope_scores`).
+            self.generation += 1;
+            for scope in self.scopes.values_mut() {
+                scope.answered.extend(&answered);
+            }
+        }
         let unsaved = match self.saved_review_count {
             Some(saved) if !plan.reset => review_count.saturating_sub(saved),
             _ => u64::MAX,
@@ -267,6 +287,27 @@ fn forecast_input(mut query: ReviewInput, secs: i64, days: i64) -> ReviewInput {
 
 fn valid_probability(value: f32) -> Option<f32> {
     (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(value)
+}
+
+/// The current retrievability of each row's card (cards the model can't
+/// score are left out).
+fn score_rows(runtime: &mut RwkvOfflineRuntime, rows: &[Row]) -> Result<Vec<ScoredCard>> {
+    let inputs: Vec<_> = rows.iter().map(query_input).collect();
+    let retrievabilities = runtime
+        .inference
+        .predict_retrievability_many_from_warm_up(inputs)?;
+    Ok(rows
+        .iter()
+        .zip(retrievabilities)
+        .filter_map(|(row, retrievability)| {
+            Some(ScoredCard {
+                card_id: CardId(row.card_id),
+                deck_id: DeckId(row.deck_id),
+                retrievability: valid_probability(retrievability)?,
+                target_retention: valid_probability(row.target_retention),
+            })
+        })
+        .collect())
 }
 
 fn query_input(row: &Row) -> ReviewInput {
@@ -556,9 +597,20 @@ impl Collection {
                 // not an Instant deck: scores left from another deck must not order it
                 return col.set_rwkv_review_queue_score_entries(deck_id, HashMap::new());
             };
+            let started = Instant::now();
             col.rwkv_offline_sync_history(runtime)?;
-            let cards = col.rwkv_offline_scope_scores(runtime, &deck, QUEUE_SCORE_MAX_AGE_SECS)?;
+            let synced = started.elapsed().as_millis() as u64;
+            let cards =
+                col.rwkv_offline_scope_scores(runtime, &deck, QUEUE_SCORE_MAX_AGE_SECS, true)?;
+            let scored = started.elapsed().as_millis() as u64;
             let entries = col.rwkv_offline_score_entries(&deck, &cards)?;
+            tracing::info!(
+                synced,
+                scored,
+                ms = started.elapsed().as_millis() as u64,
+                cards = cards.len(),
+                "RWKV queue scores"
+            );
             col.set_rwkv_review_queue_score_entries(deck_id, entries)
         });
         if !scored {
@@ -568,11 +620,32 @@ impl Collection {
         }
     }
 
-    /// Called after a card was answered: the retained queue was ordered with
-    /// scores that predate the answer, so the next fetch rebuilds it.
-    pub(crate) fn rwkv_offline_after_answer(&mut self) {
+    /// Called after `card_id` was answered (`mod_before` is the collection's
+    /// modification time before the answer). The answer goes into the model
+    /// state now, as the desktop's `record_reviewer_answer` does, so the next
+    /// queue build needn't check the whole review history. The retained queue
+    /// was ordered with scores that predate the answer, so the next fetch
+    /// rebuilds it.
+    pub(crate) fn rwkv_offline_after_answer(
+        &mut self,
+        card_id: CardId,
+        mod_before: TimestampMillis,
+    ) {
         if !self.rwkv_offline_enabled() {
             return;
+        }
+        if let Some(mut runtime) = self.state.rwkv_offline.take() {
+            let started = Instant::now();
+            match self.rwkv_offline_absorb_answer(&mut runtime, card_id, mod_before) {
+                Ok(absorbed) => tracing::info!(
+                    absorbed,
+                    ms = started.elapsed().as_millis() as u64,
+                    "RWKV answer"
+                ),
+                // the next history sync checks the whole history
+                Err(err) => tracing::warn!(?err, "RWKV answer not absorbed"),
+            }
+            self.state.rwkv_offline = Some(runtime);
         }
         let deck_id = self.get_current_deck_id();
         if matches!(self.rwkv_offline_deck_uses_instant(deck_id), Ok(true)) {
@@ -726,13 +799,7 @@ impl Collection {
         }
     }
 
-    /// What a model state that has absorbed `absorbed` must replay to match
-    /// the revlog; None when it already matches.
-    fn rwkv_offline_history_plan(
-        &mut self,
-        absorbed: Option<&RwkvHistoricalReviewIdentity>,
-        collection_mod: TimestampMillis,
-    ) -> Result<Option<HistoryPlan>> {
+    fn rwkv_offline_history_request(&mut self) -> Result<RwkvHistoricalReviewFingerprintRequest> {
         // The synced collection setting wins over the legacy per-preset flags,
         // as `_rwkv_collection_config_state` in rwkv_scheduler.py.
         let dynamic_preset_replay = match self.get_config_optional("rwkvDynamicPresetReplay") {
@@ -742,10 +809,54 @@ impl Collection {
                     && config.inner.rwkv_review_dynamic_preset_replay
             }),
         };
-        let mut history = RwkvHistoricalReviewFingerprintRequest {
+        Ok(RwkvHistoricalReviewFingerprintRequest {
             dynamic_preset_replay,
             ..Default::default()
+        })
+    }
+
+    /// Appends the answer to `card_id` to the model state, when nothing else
+    /// changed the collection since the history was last checked and
+    /// appending gives what a replay would. Returns whether it did.
+    fn rwkv_offline_absorb_answer(
+        &mut self,
+        runtime: &mut RwkvOfflineRuntime,
+        card_id: CardId,
+        mod_before: TimestampMillis,
+    ) -> Result<bool> {
+        let Some(identity) = runtime.identity.clone() else {
+            return Ok(false);
         };
+        if runtime.checked_at_mod != Some(mod_before) {
+            return Ok(false);
+        }
+        let history = self.rwkv_offline_history_request()?;
+        let Some((review, identity)) =
+            self.rwkv_historical_review_appended(card_id, &identity, history)?
+        else {
+            return Ok(false);
+        };
+        let collection_mod = self.storage.get_collection_timestamps()?.collection_change;
+        runtime.apply_history_plan(
+            HistoryPlan {
+                reset: false,
+                reviews: vec![answered_input(&review)],
+                identity,
+                collection_mod,
+            },
+            &self.rwkv_offline_state_path(),
+        )?;
+        Ok(true)
+    }
+
+    /// What a model state that has absorbed `absorbed` must replay to match
+    /// the revlog; None when it already matches.
+    fn rwkv_offline_history_plan(
+        &mut self,
+        absorbed: Option<&RwkvHistoricalReviewIdentity>,
+        collection_mod: TimestampMillis,
+    ) -> Result<Option<HistoryPlan>> {
+        let mut history = self.rwkv_offline_history_request()?;
 
         let mut kept = 0;
         if let Some(identity) = absorbed.filter(|id| id.review_count > 0) {
@@ -866,32 +977,105 @@ impl Collection {
 
     /// Current retrievability of the scoreable cards in `deck` and its
     /// children.
+    ///
+    /// With `partial` (queue builds), the deck's "Update the RWKV queue every
+    /// N answers" and "Use faster, approximate queue updates" apply as on the
+    /// desktop: between updates only the answered cards are rescored, and an
+    /// approximate update rescores those plus the cards most likely to come
+    /// next instead of the whole deck.
     fn rwkv_offline_scope_scores(
         &mut self,
         runtime: &mut RwkvOfflineRuntime,
         deck: &Deck,
         max_age_secs: i64,
+        partial: bool,
     ) -> Result<Vec<ScoredCard>> {
         let days_elapsed = self.timing_today()?.days_elapsed;
         let now = TimestampSecs::now();
-        if let Some(scope) = runtime.scopes.get(&deck.id) {
-            if scope.generation == runtime.generation
-                && scope.days_elapsed == days_elapsed
-                && now.0 - scope.computed_at.0 < max_age_secs
-            {
+        let config = self.rwkv_offline_deck_config(deck.id)?;
+        let include_new_cards = config.as_ref().is_some_and(|config| {
+            matches!(
+                config.inner.new_card_gather_priority(),
+                NewCardGatherPriority::DescendingRetrievability
+                    | NewCardGatherPriority::AscendingRetrievability
+            )
+        });
+        if let Some(scope) = runtime
+            .scopes
+            .get_mut(&deck.id)
+            .filter(|scope| scope.days_elapsed == days_elapsed)
+        {
+            let expired = now.0 - scope.computed_at.0 >= max_age_secs;
+            if scope.generation == runtime.generation && !expired {
+                return Ok(scope.cards.clone());
+            }
+            let interval = config
+                .as_ref()
+                .map_or(1, |c| c.inner.rwkv_review_refresh_interval.max(1));
+            let update_due = expired || scope.answered.len() >= interval as usize;
+            let approximate = config
+                .as_ref()
+                .is_some_and(|c| c.inner.rwkv_review_candidate_refresh_enabled)
+                || std::env::var("LAG_CANDIDATE_REFRESH").is_ok();
+            if partial && (!update_due || approximate) {
+                let mut card_ids = scope.answered.clone();
+                if update_due {
+                    let batch = config.as_ref().map_or(DEFAULT_REVIEW_BATCH_SIZE, |c| {
+                        match c.inner.rwkv_review_batch_size {
+                            0 => DEFAULT_REVIEW_BATCH_SIZE,
+                            n => n.clamp(MIN_REVIEW_BATCH_SIZE, MAX_REVIEW_BATCH_SIZE),
+                        }
+                    }) as usize;
+                    let descending = config.as_ref().is_some_and(|c| {
+                        c.inner.review_order() == ReviewCardOrder::RetrievabilityDescending
+                    });
+                    // ponytail: relative overdueness is ranked by recall over
+                    // target, not the queue's exact formula; fine for picking
+                    // which cards to recheck.
+                    let rank = |card: &ScoredCard| {
+                        let r = card.retrievability / card.target_retention.unwrap_or(1.0);
+                        if descending {
+                            -r
+                        } else {
+                            r
+                        }
+                    };
+                    let mut ranked: Vec<_> = scope.cards.iter().collect();
+                    let batch = batch.min(ranked.len());
+                    if batch > 0 && batch < ranked.len() {
+                        ranked.select_nth_unstable_by(batch, |a, b| rank(a).total_cmp(&rank(b)));
+                    }
+                    card_ids.extend(ranked[..batch].iter().map(|card| card.card_id));
+                    scope.answered.clear();
+                    scope.computed_at = now;
+                }
+                scope.generation = runtime.generation;
+                let rows = self
+                    .rwkv_review_input_rows_for_cards(RwkvReviewInputRowsForCardsRequest {
+                        card_ids: card_ids.iter().map(|id| id.0).collect(),
+                        include_new_cards,
+                        ..Default::default()
+                    })?
+                    .rows;
+                let tree = self.rwkv_offline_deck_tree_ids(deck)?;
+                let rescored = score_rows(runtime, &rows)?;
+                let scope = runtime.scopes.get_mut(&deck.id).unwrap();
+                let rechecked: HashSet<_> = card_ids.into_iter().collect();
+                // Rechecked cards that are no longer scoreable (or have left the
+                // deck) are dropped; the rest get their new score. Cards answered
+                // in other decks are rechecked too, but only this deck's are kept.
+                scope
+                    .cards
+                    .retain(|card| !rechecked.contains(&card.card_id));
+                scope.cards.extend(
+                    rescored
+                        .into_iter()
+                        .filter(|card| tree.contains(&card.deck_id)),
+                );
                 return Ok(scope.cards.clone());
             }
         }
 
-        let include_new_cards = self
-            .rwkv_offline_deck_config(deck.id)?
-            .is_some_and(|config| {
-                matches!(
-                    config.inner.new_card_gather_priority(),
-                    NewCardGatherPriority::DescendingRetrievability
-                        | NewCardGatherPriority::AscendingRetrievability
-                )
-            });
         let rows = self
             .rwkv_review_input_rows_for_deck_review_queue(
                 RwkvReviewInputRowsForDeckReviewQueueRequest {
@@ -901,22 +1085,7 @@ impl Collection {
                 },
             )?
             .rows;
-        let inputs: Vec<_> = rows.iter().map(query_input).collect();
-        let retrievabilities = runtime
-            .inference
-            .predict_retrievability_many_from_warm_up(inputs)?;
-        let cards: Vec<_> = rows
-            .iter()
-            .zip(retrievabilities)
-            .filter_map(|(row, retrievability)| {
-                Some(ScoredCard {
-                    card_id: CardId(row.card_id),
-                    deck_id: DeckId(row.deck_id),
-                    retrievability: valid_probability(retrievability)?,
-                    target_retention: valid_probability(row.target_retention),
-                })
-            })
-            .collect();
+        let cards = score_rows(runtime, &rows)?;
         runtime.scopes.insert(
             deck.id,
             ScopeScores {
@@ -924,6 +1093,7 @@ impl Collection {
                 days_elapsed,
                 computed_at: now,
                 cards: cards.clone(),
+                answered: Vec::new(),
             },
         );
         Ok(cards)
@@ -1028,7 +1198,7 @@ impl Collection {
         self.clear_rwkv_deck_count_scores();
         let mut scored = 0;
         for scope in scopes {
-            let cards = self.rwkv_offline_scope_scores(runtime, &scope, max_age_secs)?;
+            let cards = self.rwkv_offline_scope_scores(runtime, &scope, max_age_secs, false)?;
             scored += cards.len();
             let entries = self.rwkv_offline_score_entries(&scope, &cards)?;
             self.set_rwkv_deck_count_score_entries(scope.id, entries)?;

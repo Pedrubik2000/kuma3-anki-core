@@ -48,6 +48,8 @@ struct RwkvHistoricalReplayOptions {
     preserved_learning_start_cutoffs: HashMap<i64, i64>,
     first_review_uses_creation: Option<bool>,
     recovery_checkpoint_max_age_millis: Option<i64>,
+    /// Visit only this card's reviews (the hash then covers only those).
+    card_id: Option<CardId>,
 }
 
 pub(crate) struct RwkvReviewRescheduleItem {
@@ -88,6 +90,7 @@ impl Collection {
             self.storage.rwkv_historical_review_rows_with_cutoffs(
                 &ignored_review_ids,
                 &options.preserved_learning_start_cutoffs,
+                options.card_id,
             )?;
         let queried_review_count = rows.len() as u64;
         let checkpoint_review_count = options.recovery_checkpoint_max_age_millis.and_then(|age| {

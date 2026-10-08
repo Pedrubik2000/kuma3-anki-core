@@ -326,8 +326,10 @@ impl crate::services::SchedulerService for Collection {
         &mut self,
         input: scheduler::CardAnswer,
     ) -> Result<anki_proto::collection::OpChanges> {
+        let card_id = CardId(input.card_id);
+        let mod_before = self.storage.get_collection_timestamps()?.collection_change;
         let output = self.answer_card(&mut input.into())?;
-        self.rwkv_offline_after_answer();
+        self.rwkv_offline_after_answer(card_id, mod_before);
         Ok(output.into())
     }
 
