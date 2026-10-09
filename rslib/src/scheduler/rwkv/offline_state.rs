@@ -57,17 +57,21 @@ pub(super) fn write(
     identity: &[u8],
     inference: &RwkvInference,
 ) -> io::Result<()> {
-    let temporary = path.with_extension("rwkv-offline.tmp");
-    let mut out = BufWriter::with_capacity(BUFFER, fs::File::create(&temporary)?);
+    // a name of its own: two builds for one collection (profile switching) don't
+    // write into the same file, and a failed write leaves nothing behind
+    let mut temporary = tempfile::Builder::new()
+        .suffix(".rwkv-offline.tmp")
+        .tempfile_in(path.parent().unwrap_or(Path::new(".")))?;
+    let mut out = BufWriter::with_capacity(BUFFER, temporary.as_file_mut());
     out.write_all(MAGIC)?;
     put_bytes(&mut out, header.as_bytes())?;
     put_bytes(&mut out, identity)?;
     inference.write_warm_up_states(&mut out)?;
     put_bytes(&mut out, &inference.cache_state())?;
-    let file = out.into_inner().map_err(|err| err.into_error())?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&temporary, path)
+    out.into_inner()
+        .map_err(|err| err.into_error())?
+        .sync_all()?;
+    temporary.persist(path).map(drop).map_err(|err| err.error)
 }
 
 /// Reads the file written by [write] into `inference` and returns the history
