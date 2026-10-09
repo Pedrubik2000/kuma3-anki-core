@@ -514,41 +514,132 @@ mod tests {
         assert!(deferred.is_ready(now));
     }
 
-    /// kuma3: kumapie answers a word's own card wherever it is in the queue.
-    #[test]
-    fn answering_a_card_below_the_top_rebuilds_the_queue() -> Result<()> {
+    // kuma3: kumapie answers a word's own cards wherever they are in the queue (not
+    // only its top).
+    mod answering_below_the_top {
+        use super::*;
         use crate::card::CardQueue;
+        use crate::card::CardType;
         use crate::scheduler::answering::CardAnswer;
         use crate::scheduler::answering::Rating;
         use crate::tests::NoteAdder;
-        let mut col = Collection::new();
-        NoteAdder::basic(&mut col).add(&mut col);
-        NoteAdder::basic(&mut col).add(&mut col);
-        let queued = col.get_queued_cards(2, false, false)?;
-        let second = &queued.cards[1];
-        let states = second.states.clone().unwrap();
-        col.answer_card(&mut CardAnswer {
-            card_id: second.card.id,
-            current_state: states.current,
-            new_state: states.good,
-            rating: Rating::Good,
-            answered_at: TimestampMillis::now(),
-            milliseconds_taken: 0,
-            custom_data: None,
-            desired_retention_override: None,
-            rwkv_s90: None,
-            rwkv_retrievability: None,
-            rwkv_review_kind: None,
-            from_queue: true,
-        })?;
-        assert_ne!(
-            col.storage.get_card(second.card.id)?.unwrap().queue,
-            CardQueue::New
-        );
-        assert_eq!(
-            col.get_next_card()?.unwrap().card.id,
-            queued.cards[0].card.id
-        );
-        Ok(())
+
+        /// A collection with three cards in its queue: new ones, or review ones
+        /// due today.
+        fn three_cards(review: bool) -> Result<(Collection, Vec<CardId>)> {
+            let mut col = Collection::new();
+            for _ in 0..3 {
+                NoteAdder::basic(&mut col).add(&mut col);
+            }
+            if review {
+                for _ in 0..3 {
+                    col.answer_easy();
+                }
+                col.storage.db.execute_batch("UPDATE cards SET due = 0")?;
+                col.clear_study_queues();
+            }
+            let ids = col
+                .get_queued_cards(3, false, false)?
+                .cards
+                .iter()
+                .map(|c| c.card.id)
+                .collect();
+            Ok((col, ids))
+        }
+
+        /// Answers the card at [index] of the built queue, as kumapie does
+        /// through kuma3's provider.
+        fn answer_at(col: &mut Collection, index: usize, rating: Rating) -> Result<()> {
+            let queued = col.get_queued_cards(3, false, false)?.cards.remove(index);
+            let states = queued.states.unwrap();
+            let new_state = match rating {
+                Rating::Again => states.again,
+                Rating::Hard => states.hard,
+                Rating::Good => states.good,
+                Rating::Easy => states.easy,
+            };
+            col.answer_card(&mut CardAnswer {
+                card_id: queued.card.id,
+                current_state: states.current,
+                new_state,
+                rating,
+                answered_at: TimestampMillis::now(),
+                milliseconds_taken: 0,
+                custom_data: None,
+                desired_retention_override: None,
+                rwkv_s90: None,
+                rwkv_retrievability: None,
+                rwkv_review_kind: None,
+                from_queue: true,
+            })?;
+            Ok(())
+        }
+
+        /// Again on the card at [index]: it goes to (re)learning, nothing is
+        /// lost, the others keep their order.
+        fn again_at(review: bool, index: usize) -> Result<()> {
+            let (mut col, ids) = three_cards(review)?;
+            answer_at(&mut col, index, Rating::Again)?;
+            let again = col.storage.get_card(ids[index])?.unwrap();
+            assert_eq!(again.queue, CardQueue::Learn);
+            assert_eq!(
+                again.ctype,
+                if review {
+                    CardType::Relearn
+                } else {
+                    CardType::Learn
+                }
+            );
+            let rest: Vec<CardId> = ids.iter().copied().filter(|id| *id != ids[index]).collect();
+            let queued = col.get_queued_cards(3, false, false)?;
+            assert_eq!(
+                queued
+                    .cards
+                    .iter()
+                    .map(|c| c.card.id)
+                    .take(2)
+                    .collect::<Vec<_>>(),
+                rest
+            );
+            assert_eq!(queued.learning_count, 1);
+            assert_eq!(
+                if review {
+                    queued.review_count
+                } else {
+                    queued.new_count
+                },
+                2
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn good_on_the_second_card() -> Result<()> {
+            let (mut col, ids) = three_cards(false)?;
+            answer_at(&mut col, 1, Rating::Good)?;
+            assert_ne!(col.storage.get_card(ids[1])?.unwrap().queue, CardQueue::New);
+            assert_eq!(col.get_next_card()?.unwrap().card.id, ids[0]);
+            Ok(())
+        }
+
+        #[test]
+        fn again_on_the_middle_new_card() -> Result<()> {
+            again_at(false, 1)
+        }
+
+        #[test]
+        fn again_on_the_last_new_card() -> Result<()> {
+            again_at(false, 2)
+        }
+
+        #[test]
+        fn again_on_the_middle_review_card() -> Result<()> {
+            again_at(true, 1)
+        }
+
+        #[test]
+        fn again_on_the_last_review_card() -> Result<()> {
+            again_at(true, 2)
+        }
     }
 }
