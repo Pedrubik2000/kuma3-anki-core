@@ -1972,9 +1972,8 @@ insert into segments (
             .iter()
             .map(|input| self.features.features_for(input))
             .collect::<Vec<_>>();
-        let this = &*self;
-        this.review_in_chunks(inputs, &features, states, |index, heads| {
-            let (current_interval, current_s90) = this.current_intervals(&inputs[index], &heads);
+        self.review_in_chunks(inputs, &features, states, |index, heads| {
+            let (current_interval, current_s90) = self.current_intervals(&inputs[index], &heads);
             RwkvWorkloadQueryPrediction {
                 retrievability: heads.retrievability,
                 current_interval,
