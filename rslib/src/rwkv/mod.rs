@@ -1339,18 +1339,27 @@ insert into segments (
         let mut note = HalfStateMap::default();
         let mut deck = HashMap::new();
         let mut preset = HashMap::new();
-        let maps: [&mut dyn StateMap; 4] = [&mut card, &mut note, &mut deck, &mut preset];
-        for map in maps {
+        // the file's map order (card, note, deck, preset) against the model's module
+        // order (card, deck, note, preset, global): every state must have its
+        // module's layer count
+        let layers = |module: usize| self.model.modules[module].layers.len();
+        let maps: [(&mut dyn StateMap, usize); 4] = [
+            (&mut card, layers(0)),
+            (&mut note, layers(2)),
+            (&mut deck, layers(1)),
+            (&mut preset, layers(3)),
+        ];
+        for (map, layers) in maps {
             let count = read_u64_le(input)?;
             for _ in 0..count {
                 let id = read_u64_le(input)? as i64;
-                map.put(id, read_half_module_state(input, &mut buffer)?);
+                map.put(id, read_half_module_state(input, &mut buffer, layers)?);
             }
         }
         let mut flag = [0_u8];
         input.read_exact(&mut flag)?;
         let global = match flag[0] {
-            1 => Some(read_half_module_state(input, &mut buffer)?),
+            1 => Some(read_half_module_state(input, &mut buffer, layers(4))?),
             _ => None,
         };
         self.warm_up_states = ReviewStateMaps {
@@ -2165,7 +2174,7 @@ fn read_runtime_cache_state(bytes: &[u8]) -> io::Result<(FeatureState, HashMap<i
     let mut cursor = Cursor::new(bytes);
     cursor.expect_magic(b"ARWKVPROCSTATE2")?;
     let features = FeatureState::read_cache_state(&mut cursor)?;
-    let curve_count = cursor.u32()? as usize;
+    let curve_count = cursor.count(16)?; // card id + two vector lengths
     let mut curves = HashMap::with_capacity(curve_count);
     for _ in 0..curve_count {
         let card_id = cursor.i64()?;
@@ -2820,12 +2829,18 @@ fn id_encoding_dim(kind: IdKind) -> usize {
 }
 
 fn read_id_encodings(cursor: &mut Cursor<'_>) -> io::Result<HashMap<(IdKind, i64), Vec<f32>>> {
-    let count = cursor.u32()? as usize;
+    let count = cursor.count(13)?; // kind + id + vector length
     let mut values = HashMap::with_capacity(count);
     for _ in 0..count {
         let kind = IdKind::from_cache_code(cursor.u8()?)?;
         let value = cursor.i64()?;
         let encoding = cursor.f32_vec()?;
+        if encoding.len() != id_encoding_dim(kind) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "damaged RWKV id encoding",
+            ));
+        }
         values.insert((kind, value), encoding);
     }
     Ok(values)
@@ -3192,6 +3207,20 @@ impl<'a> Cursor<'a> {
                 "trailing bytes in file",
             ))
         }
+    }
+
+    /// A count read from the data, refused when that many entries of at least
+    /// `entry_bytes` can't fit in what is left: a damaged count would otherwise
+    /// reserve gigabytes up front and abort the app.
+    fn count(&mut self, entry_bytes: usize) -> io::Result<usize> {
+        let count = self.u32()? as usize;
+        if count.saturating_mul(entry_bytes) > self.data.len() - self.offset {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "count larger than the data",
+            ));
+        }
+        Ok(count)
     }
 
     fn bytes(&mut self, len: usize) -> io::Result<&'a [u8]> {
@@ -4350,25 +4379,28 @@ fn read_u32_le(input: &mut impl io::Read) -> io::Result<u32> {
 }
 
 /// Reads what [write_half_module_state] wrote; `buffer` is reused between
-/// states.
+/// states. The state must have the shape the model gives every state it makes:
+/// `layers` layers, each with its x shift (D_MODEL), time-mix matrix (HEADS ×
+/// HEAD_SIZE²) and channel shift (D_MODEL); anything else is a damaged file.
 fn read_half_module_state(
     input: &mut impl io::Read,
     buffer: &mut Vec<u8>,
+    layers: usize,
 ) -> io::Result<ModuleState> {
-    let layer_count = read_u32_le(input)?;
-    if layer_count > 64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "damaged RWKV state",
-        ));
+    fn damaged() -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, "damaged RWKV state")
     }
-    fn read_values(input: &mut impl io::Read, buffer: &mut Vec<u8>) -> io::Result<Vec<f32>> {
+    if read_u32_le(input)? as usize != layers {
+        return Err(damaged());
+    }
+    fn read_values(
+        input: &mut impl io::Read,
+        buffer: &mut Vec<u8>,
+        want: usize,
+    ) -> io::Result<Vec<f32>> {
         let len = read_u32_le(input)? as usize;
-        if len > 1 << 20 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "damaged RWKV state",
-            ));
+        if len != want {
+            return Err(damaged());
         }
         buffer.resize(len * 2, 0);
         input.read_exact(buffer)?;
@@ -4377,17 +4409,17 @@ fn read_half_module_state(
             .map(|half| f32_from_f16_bits(u16::from_le_bytes([half[0], half[1]])))
             .collect())
     }
-    let mut layers = Vec::with_capacity(layer_count as usize);
-    for _ in 0..layer_count {
-        let x_shift = read_values(input, buffer)?;
-        let matrix = read_values(input, buffer)?;
-        let channel_shift = read_values(input, buffer)?;
-        layers.push(LayerState {
+    let mut states = Vec::with_capacity(layers);
+    for _ in 0..layers {
+        let x_shift = read_values(input, buffer, D_MODEL)?;
+        let matrix = read_values(input, buffer, HEADS * HEAD_SIZE * HEAD_SIZE)?;
+        let channel_shift = read_values(input, buffer, D_MODEL)?;
+        states.push(LayerState {
             time: Some(TimeState { x_shift, matrix }),
             channel_shift: Some(channel_shift),
         });
     }
-    Ok(ModuleState { layers })
+    Ok(ModuleState { layers: states })
 }
 
 /// IEEE half of `value`, rounded to nearest (ties to even).
@@ -5065,7 +5097,7 @@ fn write_state_cache_i64_set(
 }
 
 fn read_i64_set(cursor: &mut Cursor<'_>) -> io::Result<HashMap<i64, ()>> {
-    let count = cursor.u32()? as usize;
+    let count = cursor.count(8)?;
     let mut values = HashMap::with_capacity(count);
     for _ in 0..count {
         values.insert(cursor.i64()?, ());
@@ -5088,7 +5120,7 @@ fn write_state_cache_i64_map(
 }
 
 fn read_i64_map(cursor: &mut Cursor<'_>) -> io::Result<HashMap<i64, i64>> {
-    let count = cursor.u32()? as usize;
+    let count = cursor.count(16)?;
     let mut values = HashMap::with_capacity(count);
     for _ in 0..count {
         values.insert(cursor.i64()?, cursor.i64()?);
@@ -11638,6 +11670,52 @@ order by e.id, e.cid
         assert_eq!(features.previous_day_offset, None);
         assert_eq!(features.today_reviews, 0);
         assert_eq!(features.today_new_cards, 0);
+    }
+
+    /// kuma3's state file: a state with another shape than the model's, or a
+    /// count that can't fit in the data, is refused (it would panic or abort
+    /// later); a state of the right shape reads back.
+    #[test]
+    fn offline_state_reader_refuses_wrong_shapes_and_counts() {
+        let state = |x_shift: usize| ModuleState {
+            layers: vec![LayerState {
+                time: Some(TimeState {
+                    x_shift: vec![0.5; x_shift],
+                    matrix: vec![0.25; HEADS * HEAD_SIZE * HEAD_SIZE],
+                }),
+                channel_shift: Some(vec![1.0; D_MODEL]),
+            }],
+        };
+        let read = |state: &ModuleState, layers: usize| {
+            let mut bytes = Vec::new();
+            write_half_module_state(&mut bytes, state).unwrap();
+            read_half_module_state(&mut bytes.as_slice(), &mut Vec::new(), layers)
+        };
+        let back = read(&state(D_MODEL), 1).unwrap();
+        assert_eq!(
+            back.layers[0].time.as_ref().unwrap().x_shift,
+            vec![0.5; D_MODEL]
+        );
+        assert!(
+            read(&state(D_MODEL - 1), 1).is_err(),
+            "x shift of the wrong length"
+        );
+        assert!(read(&state(D_MODEL), 2).is_err(), "wrong layer count");
+        let mut empty = state(D_MODEL);
+        empty.layers[0].time = None;
+        assert!(
+            read(&empty, 1).is_err(),
+            "absent parts are written empty and refused"
+        );
+
+        let huge = u32::MAX.to_le_bytes();
+        assert!(
+            Cursor::new(&huge).count(8).is_err(),
+            "count larger than the data"
+        );
+        let mut small = 2_u32.to_le_bytes().to_vec();
+        small.extend([0; 16]);
+        assert_eq!(Cursor::new(&small).count(8).unwrap(), 2);
     }
 
     #[test]
