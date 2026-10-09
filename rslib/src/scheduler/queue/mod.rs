@@ -396,7 +396,12 @@ impl Collection {
         is_finished_preview: bool,
     ) -> Result<()> {
         if let Some(queues) = &mut self.state.card_queues {
-            let entry = queues.pop_entry(card.id)?;
+            let Ok(entry) = queues.pop_entry(card.id) else {
+                // kuma3: a card answered from outside the queue's top (kumapie rates a word's
+                // own cards wherever they are): the queue is built again when it's next needed.
+                self.clear_study_queues();
+                return Ok(());
+            };
             let requeued_learning = if is_finished_preview {
                 None
             } else {
@@ -507,5 +512,43 @@ mod tests {
 
         deferred.eligible_at = Some(now);
         assert!(deferred.is_ready(now));
+    }
+
+    /// kuma3: kumapie answers a word's own card wherever it is in the queue.
+    #[test]
+    fn answering_a_card_below_the_top_rebuilds_the_queue() -> Result<()> {
+        use crate::card::CardQueue;
+        use crate::scheduler::answering::CardAnswer;
+        use crate::scheduler::answering::Rating;
+        use crate::tests::NoteAdder;
+        let mut col = Collection::new();
+        NoteAdder::basic(&mut col).add(&mut col);
+        NoteAdder::basic(&mut col).add(&mut col);
+        let queued = col.get_queued_cards(2, false, false)?;
+        let second = &queued.cards[1];
+        let states = second.states.clone().unwrap();
+        col.answer_card(&mut CardAnswer {
+            card_id: second.card.id,
+            current_state: states.current,
+            new_state: states.good,
+            rating: Rating::Good,
+            answered_at: TimestampMillis::now(),
+            milliseconds_taken: 0,
+            custom_data: None,
+            desired_retention_override: None,
+            rwkv_s90: None,
+            rwkv_retrievability: None,
+            rwkv_review_kind: None,
+            from_queue: true,
+        })?;
+        assert_ne!(
+            col.storage.get_card(second.card.id)?.unwrap().queue,
+            CardQueue::New
+        );
+        assert_eq!(
+            col.get_next_card()?.unwrap().card.id,
+            queued.cards[0].card.id
+        );
+        Ok(())
     }
 }
