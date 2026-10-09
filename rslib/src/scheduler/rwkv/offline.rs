@@ -404,7 +404,9 @@ impl Collection {
             .identity
             .as_ref()
             .map_or(0, |identity| identity.review_count);
-        self.state.rwkv_offline = Some(runtime);
+        if runtime.identity.is_some() {
+            self.state.rwkv_offline = Some(runtime);
+        }
         if rebuild {
             // the retained queue was ordered with the old state's scores
             self.state.card_queues = None;
@@ -755,7 +757,10 @@ impl Collection {
             }
         };
         let result = func(self, &mut runtime);
-        self.state.rwkv_offline = Some(runtime);
+        // without identity (failed replay, changed history) it is being rebuilt
+        if runtime.identity.is_some() {
+            self.state.rwkv_offline = Some(runtime);
+        }
         if let Err(err) = &result {
             tracing::warn!(
                 ?err,
@@ -791,6 +796,15 @@ impl Collection {
             return Ok(0);
         }
         match self.rwkv_offline_history_plan(runtime.identity.as_ref(), collection_mod)? {
+            Some(plan) if plan.reset && runtime.identity.is_some() => {
+                // The history changed under the state (an undo, a full sync):
+                // replaying all of it here would hold the collection, close to a
+                // minute on a big one. The runtime without identity is dropped by
+                // the caller and rebuilt on its own thread.
+                runtime.identity = None;
+                self.rwkv_offline_start_build(runtime.model_path.clone())?;
+                invalid_input!("RWKV history changed; rebuilding in the background")
+            }
             Some(plan) => runtime.apply_history_plan(plan, &self.rwkv_offline_state_path()),
             None => {
                 runtime.checked_at_mod = Some(collection_mod);

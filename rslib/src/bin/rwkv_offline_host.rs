@@ -364,6 +364,65 @@ fn answer_check(
         report(&format!("incremental vs {label}"), &incremental, &other);
         col.close(None)?;
     }
+
+    // Undo of an answer: the history changed under the state, so it is
+    // rebuilt on its own thread; the deck list must not wait for it.
+    let mut col = CollectionBuilder::new(col_path).build()?;
+    prepare_and_wait(
+        &mut col,
+        RwkvPrepareOfflineRequest {
+            model_path: model_path.into(),
+        },
+    )?;
+    DecksService::deck_tree(&mut col, DeckTreeRequest { now })?;
+    let before_answer = all_scores(&mut col)?;
+    let cid = answered[0];
+    let states =
+        SchedulerService::get_scheduling_states(&mut col, anki_proto::cards::CardId { cid })?;
+    SchedulerService::answer_card(
+        &mut col,
+        anki_proto::scheduler::CardAnswer {
+            card_id: cid,
+            current_state: states.current.clone(),
+            new_state: states.good.clone(),
+            rating: 2,
+            answered_at_millis: now * 1000 + 100,
+            milliseconds_taken: 5_000,
+            ..Default::default()
+        },
+    )?;
+    DecksService::deck_tree(&mut col, DeckTreeRequest { now })?;
+    col.undo()?;
+    let started = Instant::now();
+    DecksService::deck_tree(&mut col, DeckTreeRequest { now })?;
+    let undo_ms = started.elapsed().as_millis();
+    let started = Instant::now();
+    while !SchedulerService::rwkv_offline_instant_pass_step(
+        &mut col,
+        RwkvOfflineInstantPassStepRequest {
+            status_only: true,
+            ..Default::default()
+        },
+    )?
+    .available
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    println!(
+        "undo: deck list after {undo_ms} ms, rebuilt in the background in {} ms",
+        started.elapsed().as_millis()
+    );
+    assert!(
+        undo_ms < 2_000,
+        "deck list waited for the replay after undo"
+    );
+    DecksService::deck_tree(&mut col, DeckTreeRequest { now })?;
+    report(
+        "before the answer vs after its undo",
+        &before_answer,
+        &all_scores(&mut col)?,
+    );
+    col.close(None)?;
     Ok(())
 }
 
