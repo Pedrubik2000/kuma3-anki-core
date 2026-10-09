@@ -1320,7 +1320,7 @@ insert into segments (
             ids.sort_unstable();
             for id in ids {
                 out.write_all(&id.to_le_bytes())?;
-                write_half_module_state(out, &map.state(&id).unwrap())?;
+                map.write_half_state(&id, out)?;
             }
         }
         match &states.global {
@@ -1973,13 +1973,33 @@ insert into segments (
             .map(|input| self.features.features_for(input))
             .collect::<Vec<_>>();
         let this = &*self;
-        let mut predictions = Vec::with_capacity(inputs.len());
-        for (chunk, (chunk_inputs, features)) in inputs
+        this.review_in_chunks(inputs, &features, states, |index, heads| {
+            let (current_interval, current_s90) = this.current_intervals(&inputs[index], &heads);
+            RwkvWorkloadQueryPrediction {
+                retrievability: heads.retrievability,
+                current_interval,
+                current_s90,
+            }
+        })
+    }
+
+    /// The model's review of each of `inputs` (with its `features`) from
+    /// `states`, whose half states are converted [STATE_VIEW_CHUNK] at a time;
+    /// `map` gets the index into `inputs`.
+    fn review_in_chunks<T: Send>(
+        &self,
+        inputs: &[ReviewInput],
+        features: &[Vec<f32>],
+        states: &SimulationStates<'_>,
+        map: impl Fn(usize, ReviewHeads) -> T + Sync,
+    ) -> Vec<T> {
+        let mut out = Vec::with_capacity(inputs.len());
+        for (chunk, (inputs, features)) in inputs
             .chunks(STATE_VIEW_CHUNK)
             .zip(features.chunks(STATE_VIEW_CHUNK))
             .enumerate()
         {
-            let views = chunk_inputs
+            let views = inputs
                 .iter()
                 .map(|input| states.state_view(input))
                 .collect::<Vec<_>>();
@@ -1992,20 +2012,12 @@ insert into segments (
                 })
                 .collect::<Vec<_>>();
             let offset = chunk * STATE_VIEW_CHUNK;
-            predictions.extend(
-                this.model
-                    .review_many_borrowed(&work_items, |index, heads| {
-                        let (current_interval, current_s90) =
-                            this.current_intervals(&inputs[offset + index], &heads);
-                        RwkvWorkloadQueryPrediction {
-                            retrievability: heads.retrievability,
-                            current_interval,
-                            current_s90,
-                        }
-                    }),
+            out.extend(
+                self.model
+                    .review_many_borrowed(&work_items, |index, heads| map(offset + index, heads)),
             );
         }
-        predictions
+        out
     }
 
     fn selected_answer_intervals_for_inputs(
@@ -2026,37 +2038,11 @@ insert into segments (
             .collect::<Vec<_>>();
         let (default_retention, max_interval_days) =
             (self.target_retention, self.max_interval_days);
-        let mut intervals = Vec::with_capacity(inputs.len());
-        for (chunk, (chunk_inputs, features)) in answer_inputs
-            .chunks(STATE_VIEW_CHUNK)
-            .zip(features.chunks(STATE_VIEW_CHUNK))
-            .enumerate()
-        {
-            let views = chunk_inputs
-                .iter()
-                .map(|input| states.state_view(input))
-                .collect::<Vec<_>>();
-            let work_items = features
-                .iter()
-                .zip(&views)
-                .map(|(features, view)| ReviewPredictionBorrowedWorkItem {
-                    features: features.clone(),
-                    state: view.as_ref(),
-                })
-                .collect::<Vec<_>>();
-            let offset = chunk * STATE_VIEW_CHUNK;
-            intervals.extend(
-                self.model
-                    .review_many_borrowed(&work_items, |index, heads| {
-                        let index = offset + index;
-                        let target_retention = inputs[index].target_retentions
-                            [(eases[index] - 1) as usize]
-                            .unwrap_or(default_retention);
-                        interval_for_curve(&heads.curve, target_retention, max_interval_days)
-                    }),
-            );
-        }
-        intervals
+        self.review_in_chunks(&answer_inputs, &features, states, |index, heads| {
+            let target_retention = inputs[index].target_retentions[(eases[index] - 1) as usize]
+                .unwrap_or(default_retention);
+            interval_for_curve(&heads.curve, target_retention, max_interval_days)
+        })
     }
 
     fn apply_simulation_answer(
@@ -4358,7 +4344,7 @@ fn write_half_module_state(out: &mut impl io::Write, state: &ModuleState) -> io:
             bytes.clear();
             bytes.extend_from_slice(&(values.len() as u32).to_le_bytes());
             for value in values {
-                bytes.extend_from_slice(&f16_bits(*value).to_le_bytes());
+                bytes.extend_from_slice(&half::f16::from_f32(*value).to_le_bytes());
             }
             out.write_all(&bytes)?;
         }
@@ -4406,7 +4392,7 @@ fn read_half_module_state(
         input.read_exact(buffer)?;
         Ok(buffer
             .chunks_exact(2)
-            .map(|half| f32_from_f16_bits(u16::from_le_bytes([half[0], half[1]])))
+            .map(|bytes| half::f16::from_le_bytes([bytes[0], bytes[1]]).to_f32())
             .collect())
     }
     let mut states = Vec::with_capacity(layers);
@@ -4420,42 +4406,6 @@ fn read_half_module_state(
         });
     }
     Ok(ModuleState { layers: states })
-}
-
-/// IEEE half of `value`, rounded to nearest (ties to even).
-fn f16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let abs = bits & 0x7fff_ffff;
-    if abs > 0x7f80_0000 {
-        return sign | 0x7e00; // NaN
-    }
-    if abs >= 0x477f_f000 {
-        return sign | 0x7c00; // rounds to 65520 or more: infinity
-    }
-    if abs >= 0x3880_0000 {
-        // normal: rebias the exponent, round away the low 13 mantissa bits
-        let rounded = abs + 0x0fff + ((abs >> 13) & 1);
-        return sign | ((rounded - 0x3800_0000) >> 13) as u16;
-    }
-    // subnormal (or zero): steps of 2^-24
-    sign | (f32::from_bits(abs) * 16_777_216.0).round_ties_even() as u16
-}
-
-fn f32_from_f16_bits(half: u16) -> f32 {
-    let magnitude = match (half >> 10) & 0x1f {
-        0 => f32::from(half & 0x3ff) / 16_777_216.0,
-        0x1f if half & 0x3ff == 0 => f32::INFINITY,
-        0x1f => f32::NAN,
-        exponent => {
-            f32::from_bits((u32::from(exponent) + 112) << 23 | u32::from(half & 0x3ff) << 13)
-        }
-    };
-    if half & 0x8000 != 0 {
-        -magnitude
-    } else {
-        magnitude
-    }
 }
 
 fn write_snapshot_module_state(out: &mut impl io::Write, state: &ModuleState) -> io::Result<()> {
@@ -5771,6 +5721,10 @@ trait StateMap {
     fn count(&self) -> usize;
     /// The length [serialize_module_state] gives the state.
     fn serialized_len(&self, id: &i64) -> Option<usize>;
+    /// Writes the state (it must be there) as [write_half_module_state] does.
+    fn write_half_state(&self, id: &i64, mut out: &mut dyn io::Write) -> io::Result<()> {
+        write_half_module_state(&mut out, &self.state(id).unwrap())
+    }
 }
 
 impl StateMap for HashMap<i64, ModuleState> {
@@ -5814,6 +5768,21 @@ impl StateMap for HalfStateMap {
     }
     fn serialized_len(&self, id: &i64) -> Option<usize> {
         self.0.get(id).map(HalfModuleState::serialized_len)
+    }
+    /// Already halves: written as they are.
+    fn write_half_state(&self, id: &i64, out: &mut dyn io::Write) -> io::Result<()> {
+        let state = &self.0[id];
+        let mut bytes = (state.lens.len() as u32).to_le_bytes().to_vec();
+        let mut at = 0;
+        for len in state.lens.iter().flatten() {
+            let len = if *len == ABSENT { 0 } else { *len as usize };
+            bytes.extend_from_slice(&(len as u32).to_le_bytes());
+            for value in &state.values[at..at + len] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            at += len;
+        }
+        out.write_all(&bytes)
     }
 }
 
@@ -11708,6 +11677,16 @@ order by e.id, e.cid
             "absent parts are written empty and refused"
         );
 
+        // half states are written as they are, the same bytes as via f32
+        let mut values = state(D_MODEL);
+        values.layers[0].time.as_mut().unwrap().matrix[7] = 0.333_333_34;
+        values.layers.push(empty.layers[0].clone());
+        let halves: HalfStateMap = [(1, values)].into_iter().collect();
+        let (mut direct, mut via_f32) = (Vec::new(), Vec::new());
+        halves.write_half_state(&1, &mut direct).unwrap();
+        write_half_module_state(&mut via_f32, &halves.state(&1).unwrap()).unwrap();
+        assert_eq!(direct, via_f32);
+
         let huge = u32::MAX.to_le_bytes();
         assert!(
             Cursor::new(&huge).count(8).is_err(),
@@ -11716,29 +11695,6 @@ order by e.id, e.cid
         let mut small = 2_u32.to_le_bytes().to_vec();
         small.extend([0; 16]);
         assert_eq!(Cursor::new(&small).count(8).unwrap(), 2);
-    }
-
-    #[test]
-    fn f16_conversion_round_trips_and_rounds() {
-        for half in 0..=u16::MAX {
-            let value = f32_from_f16_bits(half);
-            if value.is_nan() {
-                assert!(f16_bits(value) & 0x7c00 == 0x7c00 && f16_bits(value) & 0x3ff != 0);
-            } else {
-                assert_eq!(f16_bits(value), half, "{half:#06x} {value}");
-            }
-        }
-        assert_eq!(f16_bits(1.0), 0x3c00);
-        assert_eq!(f16_bits(-2.0), 0xc000);
-        assert_eq!(f16_bits(65504.0), 0x7bff);
-        assert_eq!(f16_bits(65520.0), 0x7c00);
-        // halfway between 1.0 and the next half: ties to the even one (1.0)
-        assert_eq!(f16_bits(1.0 + 1.0 / 2048.0), 0x3c00);
-        assert_eq!(f16_bits(1.0 + 3.0 / 2048.0), 0x3c02);
-        // smallest subnormal, and half of it (ties to even: zero)
-        assert_eq!(f16_bits(5.960_464_5e-8), 0x0001);
-        assert_eq!(f16_bits(2.980_232_2e-8), 0x0000);
-        assert_eq!(f16_bits(0.333_333_34), 0x3555);
     }
 
     #[test]
