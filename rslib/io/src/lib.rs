@@ -281,8 +281,13 @@ fn persist_tempfile(
             Ok(_) => {}
             // Android shared storage (/storage/emulated/0, FUSE) refuses both
             // RENAME_NOREPLACE and hard links with EACCES: plain rename when
-            // the target is still free.
-            Err(err) if !target.exists() => {
+            // the target is still free. Any other error is passed on.
+            Err(err)
+                if matches!(
+                    err.error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                ) && !target.exists() =>
+            {
                 err.file.persist(target)?;
             }
             Err(err) => return Err(err.into()),

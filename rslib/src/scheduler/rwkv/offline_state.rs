@@ -120,8 +120,12 @@ fn get_bytes(input: &mut impl Read, max: u64) -> io::Result<Vec<u8>> {
     if len > max {
         return Err(invalid("length"));
     }
-    let mut bytes = vec![0; len as usize];
-    input.read_exact(&mut bytes)?;
+    // grows with what is actually there, so a damaged length can't reserve memory
+    let mut bytes = Vec::new();
+    input.take(len).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != len {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
     Ok(bytes)
 }
 
@@ -168,5 +172,17 @@ mod tests {
         let same = fs::read(&copy).unwrap() == fs::read(&file).unwrap();
         fs::remove_file(&copy).unwrap();
         assert!(same, "the written file differs from the one read");
+    }
+
+    /// A damaged length is an error, without reserving that much memory.
+    #[test]
+    fn get_bytes_checks_the_length() {
+        let mut data = (1_u64 << 30).to_le_bytes().to_vec();
+        data.extend_from_slice(b"abc");
+        let err = get_bytes(&mut data.as_slice(), 1 << 30).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        let mut data = 3_u64.to_le_bytes().to_vec();
+        data.extend_from_slice(b"abc");
+        assert_eq!(get_bytes(&mut data.as_slice(), 1 << 30).unwrap(), b"abc");
     }
 }
