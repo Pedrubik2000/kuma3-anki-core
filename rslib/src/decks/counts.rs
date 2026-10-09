@@ -161,7 +161,7 @@ impl Collection {
         };
 
         let mut pull_candidates = Vec::new();
-        let mut waiting = Vec::new();
+        let mut waiting = HashSet::new();
         for (card_id, score) in scores {
             let Some(metadata) = metadata.get(card_id) else {
                 continue;
@@ -191,7 +191,7 @@ impl Collection {
                     .target_retention
                     .is_some_and(|target| score.retrievability < target)
             {
-                waiting.push(*card_id);
+                waiting.insert(*card_id);
             }
             let Some(counts) = counts.get_mut(&metadata.current_deck_id) else {
                 continue;
@@ -268,7 +268,7 @@ impl Collection {
         pull_candidates.sort_unstable_by(|(card_a, score_a, _), (card_b, score_b, _)| {
             score_a.total_cmp(score_b).then_with(|| card_a.cmp(card_b))
         });
-        let mut minimum = Vec::new();
+        let mut minimum = HashSet::new();
         for (card_id, _, deck_id) in pull_candidates {
             if !minimums.rwkv_review_minimum_remaining(deck_id)? {
                 continue;
@@ -276,7 +276,7 @@ impl Collection {
             if let Some(counts) = counts.get_mut(&deck_id) {
                 counts.review = counts.review.saturating_add(1);
                 minimums.reserve_rwkv_reviews(deck_id, 1)?;
-                minimum.push(card_id);
+                minimum.insert(card_id);
             }
         }
         self.state

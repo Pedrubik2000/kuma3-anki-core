@@ -1305,34 +1305,27 @@ insert into segments (
         Ok(())
     }
 
-    /// Writes the warm-up states one at a time, without holding a second copy
-    /// of them in memory (kuma3's offline state file): the card, note, deck
-    /// and preset maps (u64 count, then i64 id + state, by id), then the
-    /// global state (flag byte + state). A state is stored as 16-bit floats
-    /// (see [write_half_module_state]): half the size, and the RWKV
-    /// predictions don't change measurably.
-    pub fn write_warm_up_states(&self, out: &mut impl io::Write) -> io::Result<()> {
+    /// What kuma3's offline state file holds, taken now to be written on
+    /// another thread: card and note states are shared ([HalfModuleState]),
+    /// so this copies pointers, not the states (the deck, preset and global
+    /// ones are few and copied).
+    pub fn state_snapshot(&self) -> RwkvStateSnapshot {
         let states = &self.warm_up_states;
-        let maps: [&dyn StateMap; 4] = [&states.card, &states.note, &states.deck, &states.preset];
-        for map in maps {
-            out.write_all(&(map.count() as u64).to_le_bytes())?;
-            let mut ids = map.ids();
-            ids.sort_unstable();
-            for id in ids {
-                out.write_all(&id.to_le_bytes())?;
-                map.write_half_state(&id, out)?;
-            }
-        }
-        match &states.global {
-            Some(state) => {
-                out.write_all(&[1])?;
-                write_half_module_state(out, state)
-            }
-            None => out.write_all(&[0]),
+        RwkvStateSnapshot {
+            states: ReviewStateMaps {
+                card: states.card.clone(),
+                note: states.note.clone(),
+                deck: states.deck.clone(),
+                preset: states.preset.clone(),
+                global: states.global.clone(),
+                ..Default::default()
+            },
+            cache_state: self.cache_state(),
         }
     }
 
-    /// Reads what [Self::write_warm_up_states] wrote, one state at a time.
+    /// Reads what [RwkvStateSnapshot::write_warm_up_states] wrote, one state at
+    /// a time.
     pub fn read_warm_up_states(&mut self, input: &mut impl io::Read) -> io::Result<()> {
         let mut buffer = Vec::new();
         let mut card = HalfStateMap::default();
@@ -3765,6 +3758,45 @@ struct SrsState {
     global: ModuleState,
 }
 
+/// See [RwkvInference::state_snapshot].
+pub struct RwkvStateSnapshot {
+    states: ReviewStateMaps,
+    cache_state: Vec<u8>,
+}
+
+impl RwkvStateSnapshot {
+    /// Writes the warm-up states one at a time (kuma3's offline state file):
+    /// the card, note, deck and preset maps (u64 count, then i64 id + state,
+    /// by id), then the global state (flag byte + state). A state is stored as
+    /// 16-bit floats (see [write_half_module_state]): half the size, and the
+    /// RWKV predictions don't change measurably.
+    pub fn write_warm_up_states(&self, out: &mut impl io::Write) -> io::Result<()> {
+        let states = &self.states;
+        let maps: [&dyn StateMap; 4] = [&states.card, &states.note, &states.deck, &states.preset];
+        for map in maps {
+            out.write_all(&(map.count() as u64).to_le_bytes())?;
+            let mut ids = map.ids();
+            ids.sort_unstable();
+            for id in ids {
+                out.write_all(&id.to_le_bytes())?;
+                map.write_half_state(&id, out)?;
+            }
+        }
+        match &states.global {
+            Some(state) => {
+                out.write_all(&[1])?;
+                write_half_module_state(out, state)
+            }
+            None => out.write_all(&[0]),
+        }
+    }
+
+    /// What [RwkvInference::cache_state] gave when the snapshot was taken.
+    pub fn cache_state(&self) -> &[u8] {
+        &self.cache_state
+    }
+}
+
 #[derive(Default)]
 struct ReviewStateMaps {
     card: HalfStateMap,
@@ -5633,12 +5665,15 @@ impl RwkvLayer {
 #[derive(Clone, Default)]
 struct HalfStateMap(HashMap<i64, HalfModuleState>);
 
+/// Shared (`Arc`), so copying a map of them copies pointers: the state file is
+/// written from such a copy on another thread ([RwkvStateSnapshot]). A state is
+/// never changed in place, only replaced, so the copy stays as it was.
 #[derive(Clone)]
 struct HalfModuleState {
     /// Per layer, the lengths of the time-mix shift, time-mix matrix and
     /// channel-mix shift (`ABSENT`: no such part).
-    lens: Box<[[u32; 3]]>,
-    values: Box<[half::f16]>,
+    lens: Arc<[[u32; 3]]>,
+    values: Arc<[half::f16]>,
 }
 
 const ABSENT: u32 = u32::MAX;
@@ -5658,7 +5693,7 @@ impl HalfModuleState {
                 layer.channel_shift.as_deref(),
             ]
         }
-        let lens: Box<[[u32; 3]]> = state
+        let lens: Arc<[[u32; 3]]> = state
             .layers
             .iter()
             .map(|layer| parts(layer).map(|part| part.map_or(ABSENT, |p| p.len() as u32)))
@@ -5674,7 +5709,10 @@ impl HalfModuleState {
             values[at..at + part.len()].convert_from_f32_slice(part);
             at += part.len();
         }
-        Self { lens, values }
+        Self {
+            lens,
+            values: values.into(),
+        }
     }
 
     fn to_module_state(&self) -> ModuleState {

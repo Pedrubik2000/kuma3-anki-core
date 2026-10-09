@@ -250,7 +250,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.get(4).map(String::as_str) == Some("lag") {
         let deck: i64 = args[5].parse()?;
-        return lag_check(col, deck, now);
+        // optional answer count (30): 200+ reaches a state-file save
+        let answers = args.get(6).map_or(Ok(30), |n| n.parse())?;
+        return lag_check(col, deck, now, answers);
     }
     if args.get(4).map(String::as_str) == Some("answer") {
         answer_check(col, &args[1], &args[2], now)?;
@@ -480,6 +482,7 @@ fn lag_check(
     mut col: anki::collection::Collection,
     deck: i64,
     now: i64,
+    answers: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     col.set_current_deck(anki::decks::DeckId(deck))?;
     {
@@ -502,7 +505,7 @@ fn lag_check(
         fetch_limit: 1,
         ..Default::default()
     };
-    for index in 0..30 {
+    for index in 0..answers {
         let start = Instant::now();
         let queued = SchedulerService::get_queued_cards(&mut col, request.clone())?;
         let fetch_ms = start.elapsed().as_millis();

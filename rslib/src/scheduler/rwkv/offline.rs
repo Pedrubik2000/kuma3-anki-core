@@ -114,6 +114,14 @@ pub(crate) struct RwkvOfflineRuntime {
     scopes: HashMap<DeckId, ScopeScores>,
     /// Review count of the state in the state file, if it holds this one's.
     saved_review_count: Option<u64>,
+    /// The state file being written ([Self::save_state]).
+    saving: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for RwkvOfflineRuntime {
+    fn drop(&mut self) {
+        self.finish_saving();
+    }
 }
 
 impl fmt::Debug for RwkvOfflineRuntime {
@@ -162,6 +170,7 @@ impl RwkvOfflineRuntime {
             generation: 0,
             scopes: HashMap::new(),
             saved_review_count: None,
+            saving: None,
         })
     }
 
@@ -192,18 +201,38 @@ impl RwkvOfflineRuntime {
         Ok(())
     }
 
-    /// Writes the current state to the state file at `path`. A failure only
+    /// Writes the current state to the state file at `path`, on a thread of
+    /// its own: this runs inside an answer (every 200 of them), and writing a
+    /// big collection's file (hundreds of MB) would hold up the next card.
+    /// Only the snapshot is taken here, which copies pointers. A failure only
     /// means the next start replays more.
     fn save_state(&mut self, path: &Path) {
         let Some(identity) = self.identity.clone() else {
             return;
         };
-        let result = offline_state::header(&self.model_path).and_then(|header| {
-            offline_state::write(path, &header, &identity.encode_to_vec(), &self.inference)
-        });
-        match result {
-            Ok(()) => self.saved_review_count = Some(identity.review_count),
-            Err(err) => tracing::warn!(?err, "RWKV offline state not saved"),
+        let header = match offline_state::header(&self.model_path) {
+            Ok(header) => header,
+            Err(err) => return tracing::warn!(?err, "RWKV offline state not saved"),
+        };
+        let state = self.inference.state_snapshot();
+        let path = path.to_owned();
+        self.saved_review_count = Some(identity.review_count);
+        // the previous save first, so the newest state is the one left
+        self.finish_saving();
+        self.saving = Some(std::thread::spawn(move || {
+            if let Err(err) =
+                offline_state::write(&path, &header, &identity.encode_to_vec(), &state)
+            {
+                tracing::warn!(?err, "RWKV offline state not saved");
+            }
+        }));
+    }
+
+    /// Waits for a save still being written (also when the runtime is dropped,
+    /// so closing the collection or ending a host tool doesn't lose it).
+    fn finish_saving(&mut self) {
+        if let Some(saving) = self.saving.take() {
+            let _ = saving.join();
         }
     }
 

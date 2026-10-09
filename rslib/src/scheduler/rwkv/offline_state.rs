@@ -28,34 +28,49 @@ use std::io::BufWriter;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Mutex;
 
 use crate::rwkv::RwkvInference;
+use crate::rwkv::RwkvStateSnapshot;
 
 /// 2: states as half floats (1: full floats).
 const MAGIC: &[u8] = b"KUMA3RWKVOFFLINE2\n";
 const BUFFER: usize = 1 << 20;
 
 /// What the file must have been written for: this backend build and this model
-/// file (its size and an FNV-1a hash of its bytes).
+/// file (its size and an FNV-1a hash of its bytes). The model doesn't change
+/// while the app runs, so its 11 MB are read and hashed once, not at every
+/// save and start.
 pub(super) fn header(model_path: &Path) -> io::Result<String> {
+    static HEADER: Mutex<Option<(PathBuf, String)>> = Mutex::new(None);
+    let mut cached = HEADER.lock().unwrap();
+    if let Some((path, header)) = cached.as_ref() {
+        if path == model_path {
+            return Ok(header.clone());
+        }
+    }
     let model = fs::read(model_path)?;
     let mut hash = fnv::FnvHasher::default();
     hash.write(&model);
-    Ok(format!(
+    let header = format!(
         "{} {} {:016x}",
         crate::version::buildhash(),
         model.len(),
         hash.finish()
-    ))
+    );
+    *cached = Some((model_path.to_owned(), header.clone()));
+    Ok(header)
 }
 
 /// Writes the file whole (to a temporary file, then renamed), so a crash
-/// never leaves half a file behind.
+/// never leaves half a file behind. `state` is a snapshot, so this can run on
+/// any thread.
 pub(super) fn write(
     path: &Path,
     header: &str,
     identity: &[u8],
-    inference: &RwkvInference,
+    state: &RwkvStateSnapshot,
 ) -> io::Result<()> {
     // a name of its own: two builds for one collection (profile switching) don't
     // write into the same file, and a failed write leaves nothing behind
@@ -66,8 +81,8 @@ pub(super) fn write(
     out.write_all(MAGIC)?;
     put_bytes(&mut out, header.as_bytes())?;
     put_bytes(&mut out, identity)?;
-    inference.write_warm_up_states(&mut out)?;
-    put_bytes(&mut out, &inference.cache_state())?;
+    state.write_warm_up_states(&mut out)?;
+    put_bytes(&mut out, state.cache_state())?;
     out.into_inner()
         .map_err(|err| err.into_error())?
         .sync_all()?;
@@ -169,7 +184,7 @@ mod tests {
         eprintln!("read {} ms", started.elapsed().as_millis());
         let copy = file.with_extension("roundtrip");
         let started = Instant::now();
-        write(&copy, &header, &identity, &inference).unwrap();
+        write(&copy, &header, &identity, &inference.state_snapshot()).unwrap();
         eprintln!("write {} ms", started.elapsed().as_millis());
         let same = fs::read(&copy).unwrap() == fs::read(&file).unwrap();
         fs::remove_file(&copy).unwrap();

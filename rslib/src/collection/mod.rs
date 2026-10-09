@@ -8,6 +8,7 @@ mod transact;
 pub(crate) mod undo;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::fmt::Formatter;
@@ -160,10 +161,10 @@ pub struct CollectionState {
 #[derive(Debug, Default)]
 pub(crate) struct RwkvCountCards {
     /// Added to reach "minimum reviews per day".
-    pub(crate) minimum: Vec<CardId>,
+    pub(crate) minimum: HashSet<CardId>,
     /// Below their target but not counted yet: waiting for the repeat spacing
     /// ("minimum intervening reviews", same-day rules).
-    pub(crate) waiting: Vec<CardId>,
+    pub(crate) waiting: HashSet<CardId>,
 }
 
 pub struct Collection {
