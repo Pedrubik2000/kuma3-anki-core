@@ -1029,8 +1029,7 @@ impl Collection {
             let update_due = expired || scope.answered.len() >= interval as usize;
             let approximate = config
                 .as_ref()
-                .is_some_and(|c| c.inner.rwkv_review_candidate_refresh_enabled)
-                || std::env::var("LAG_CANDIDATE_REFRESH").is_ok();
+                .is_some_and(|c| c.inner.rwkv_review_candidate_refresh_enabled);
             if partial && (!update_due || approximate) {
                 let mut card_ids = scope.answered.clone();
                 if update_due {

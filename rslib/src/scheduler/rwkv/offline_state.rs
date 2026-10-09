@@ -21,6 +21,7 @@
 //! ignored and the history replayed once.
 
 use std::fs;
+use std::hash::Hasher;
 use std::io;
 use std::io::BufReader;
 use std::io::BufWriter;
@@ -38,16 +39,13 @@ const BUFFER: usize = 1 << 20;
 /// file (its size and an FNV-1a hash of its bytes).
 pub(super) fn header(model_path: &Path) -> io::Result<String> {
     let model = fs::read(model_path)?;
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in &model {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
+    let mut hash = fnv::FnvHasher::default();
+    hash.write(&model);
     Ok(format!(
         "{} {} {:016x}",
         crate::version::buildhash(),
         model.len(),
-        hash
+        hash.finish()
     ))
 }
 
