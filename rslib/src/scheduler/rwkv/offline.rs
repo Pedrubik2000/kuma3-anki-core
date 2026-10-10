@@ -71,6 +71,10 @@ const MAX_REVIEW_BATCH_SIZE: u32 = 8192;
 /// many reviews were absorbed since it was written (a start replays at most
 /// these few).
 const SAVE_STATE_AFTER_REVIEWS: u64 = 200;
+/// Reviews given to one bulk replay call. The bulk replay holds features and
+/// activations for every review it is given (~1 KB each): a 1M-review history
+/// in one call peaked 1.9 GB above the states, 3.7M didn't fit on a Pixel 8a.
+const REPLAY_CHUNK_REVIEWS: usize = 65_536;
 /// The forecast's default cards: review cards that RWKV-Instant schedules
 /// (learning cards follow their steps), as the desktop add-on.
 const FORECAST_SEARCH: &str = "is:review -is:learn -is:suspended -is:buried";
@@ -246,7 +250,18 @@ impl RwkvOfflineRuntime {
         let answered: Vec<_> = plan.reviews.iter().map(|r| CardId(r.card_id)).collect();
         // The identity is cleared first so a failed replay forces a rebuild.
         self.identity = None;
-        self.inference.warm_up_reviews(plan.reviews, false)?;
+        let mut reviews = plan.reviews.into_iter();
+        loop {
+            let chunk: Vec<_> = reviews.by_ref().take(REPLAY_CHUNK_REVIEWS).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            self.inference.warm_up_reviews(chunk, false)?;
+        }
+        drop(reviews);
+        if replayed >= REPLAY_CHUNK_REVIEWS as u64 {
+            release_freed_memory();
+        }
         let review_count = plan.identity.review_count;
         self.identity = Some(plan.identity);
         self.checked_at_mod = Some(plan.collection_mod);
@@ -284,6 +299,78 @@ impl RwkvOfflineRuntime {
         self.generation += 1;
         self.scopes.clear();
     }
+}
+
+/// Hands the memory a big replay freed back to the system. Each review
+/// replaces a card's state with a new allocation, and the allocator keeps the
+/// freed ones: after a 1M-review replay 0.85 GB of the 2.3 GB were free but
+/// still held, and Android counts them against the app.
+fn release_freed_memory() {
+    #[cfg(target_os = "android")]
+    {
+        use std::ffi::c_char;
+        use std::ffi::c_void;
+        extern "C" {
+            fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        }
+        // M_PURGE from bionic's malloc.h. mallopt exists from Android 8 (API
+        // 26) and minSdk is 24, so it's looked up instead of linked.
+        const M_PURGE: i32 = -101;
+        // SAFETY: RTLD_DEFAULT is the null handle on Android; the symbol, if
+        // found, is bionic's `int mallopt(int, int)`.
+        unsafe {
+            let mallopt = dlsym(std::ptr::null_mut(), c"mallopt".as_ptr());
+            if !mallopt.is_null() {
+                let mallopt: extern "C" fn(i32, i32) -> i32 = std::mem::transmute(mallopt);
+                mallopt(M_PURGE, 0);
+            }
+        }
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        // SAFETY: glibc's malloc_trim has no preconditions.
+        unsafe {
+            malloc_trim(0);
+        }
+    }
+}
+
+/// `Collection::rwkv_offline_history_plan` from a history already read: what
+/// a model state that has absorbed the history's expected identity must
+/// replay to match it; None when it already matches. One walk, no collection.
+fn history_plan(
+    history: RwkvHistoricalReviews,
+    collection_mod: TimestampMillis,
+) -> Result<Option<HistoryPlan>> {
+    let expected = history.input.expected_identity.clone();
+    let mut reviews = Vec::with_capacity(history.rows.len());
+    let fingerprint = history.walk(|review, _, _| {
+        reviews.push(answered_input(&super::history::historical_review(&review)))
+    })?;
+    if fingerprint.history_is_valid {
+        return Ok(None);
+    }
+    let mut kept = match expected {
+        Some(identity) if fingerprint.history_prefix_is_valid => identity.review_count as usize,
+        _ => 0,
+    };
+    if kept > reviews.len() {
+        kept = 0;
+    }
+    reviews.drain(..kept);
+    Ok(Some(HistoryPlan {
+        reset: kept == 0,
+        reviews,
+        identity: RwkvHistoricalReviewIdentity {
+            last_review_id: fingerprint.last_review_id,
+            review_count: fingerprint.review_count,
+            history_hash: fingerprint.history_hash,
+        },
+        collection_mod,
+    }))
 }
 
 fn answered_input(review: &Review) -> ReviewInput {
@@ -956,10 +1043,20 @@ impl Collection {
             .ok()
             .and_then(|bytes| RwkvHistoricalReviewIdentity::decode(bytes.as_slice()).ok());
         let collection_mod = self.storage.get_collection_timestamps()?.collection_change;
-        let plan = self.rwkv_offline_history_plan(planned_for.as_ref(), collection_mod)?;
-        let replaying = plan.as_ref().map_or(0, |plan| plan.reviews.len() as u64);
+        // Only reading the history needs the collection. Walking it (the
+        // check against the state file, the replay inputs) is done on the
+        // thread: it held the collection ~22 s for a 4M-review history on a
+        // Pixel 8a, and the app's main thread waits for the open.
+        let mut request = self.rwkv_offline_history_request()?;
+        request.expected_identity = planned_for.clone().filter(|id| id.review_count > 0);
+        let history = self.read_rwkv_historical_reviews(request, Default::default())?;
+        // ponytail: an estimate (for the app's message), assumes the state
+        // file is a valid prefix; the walk on the thread decides
+        let replaying = (history.rows.len() as u64)
+            .saturating_sub(planned_for.as_ref().map_or(0, |id| id.review_count));
         let handle = std::thread::spawn(move || -> Result<Box<RwkvOfflineRuntime>> {
             let started = Instant::now();
+            let plan = history_plan(history, collection_mod)?;
             let mut runtime = RwkvOfflineRuntime::load_with_saved_state(model_path, &state_path)?;
             // A file that changed since the plan was made is left to the
             // history sync after install.

@@ -64,7 +64,7 @@ impl Collection {
     }
 }
 
-fn historical_review(review: &RwkvHistoricalFingerprintReview) -> Review {
+pub(super) fn historical_review(review: &RwkvHistoricalFingerprintReview) -> Review {
     let row = review.row;
     Review {
         review_id: row.review_id,

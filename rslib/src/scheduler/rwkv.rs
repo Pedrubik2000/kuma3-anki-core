@@ -76,11 +76,21 @@ impl Collection {
         &mut self,
         input: RwkvHistoricalReviewFingerprintRequest,
         options: RwkvHistoricalReplayOptions,
-        mut visit: impl FnMut(RwkvHistoricalFingerprintReview, [u8; 32], bool),
+        visit: impl FnMut(RwkvHistoricalFingerprintReview, [u8; 32], bool),
     ) -> Result<RwkvHistoricalReviewFingerprintResponse> {
-        let started = std::time::Instant::now();
-        let mut ignored_review_ids = input
-            .ignored_review_ids
+        self.read_rwkv_historical_reviews(input, options)?
+            .walk(visit)
+    }
+
+    /// The collection reads of `visit_rwkv_historical_reviews`. Walking what
+    /// they return needs no collection: kuma3's phone build does it on the
+    /// RWKV build thread, so a 4M-review history doesn't hold the collection.
+    fn read_rwkv_historical_reviews(
+        &mut self,
+        mut input: RwkvHistoricalReviewFingerprintRequest,
+        options: RwkvHistoricalReplayOptions,
+    ) -> Result<RwkvHistoricalReviews> {
+        let mut ignored_review_ids = std::mem::take(&mut input.ignored_review_ids)
             .into_iter()
             .map(RevlogId)
             .collect::<Vec<_>>();
@@ -92,14 +102,6 @@ impl Collection {
                 &options.preserved_learning_start_cutoffs,
                 options.card_id,
             )?;
-        let queried_review_count = rows.len() as u64;
-        let checkpoint_review_count = options.recovery_checkpoint_max_age_millis.and_then(|age| {
-            let cutoff = rows.last()?.review_id - age;
-            // Match the desktop checkpoint: retain at least one review in the
-            // prefix, and leave at least one review for recovery replay.
-            let count = rows.partition_point(|row| row.review_id <= cutoff).max(1);
-            (count < rows.len()).then_some(count)
-        });
         let timing = self.timing_today()?;
 
         let card_ids = rows
@@ -124,6 +126,62 @@ impl Collection {
         };
         let decks_by_id = self.storage.get_decks_map()?;
         let configs_by_id = self.storage.get_deck_config_map()?;
+        Ok(RwkvHistoricalReviews {
+            input,
+            options,
+            ignored_review_ids,
+            rows,
+            active_ignored_review_ids,
+            timing,
+            stable_preset_ids_by_card,
+            preset_routes,
+            decks_by_id,
+            configs_by_id,
+        })
+    }
+}
+
+/// A review history as read from the collection
+/// (`read_rwkv_historical_reviews`).
+struct RwkvHistoricalReviews {
+    input: RwkvHistoricalReviewFingerprintRequest,
+    options: RwkvHistoricalReplayOptions,
+    ignored_review_ids: Vec<RevlogId>,
+    rows: Vec<RwkvHistoricalReviewRow>,
+    active_ignored_review_ids: Vec<i64>,
+    timing: SchedTimingToday,
+    stable_preset_ids_by_card: HashMap<CardId, i64>,
+    preset_routes: Vec<RwkvHistoricalPresetRoute>,
+    decks_by_id: HashMap<DeckId, Deck>,
+    configs_by_id: HashMap<DeckConfigId, DeckConfig>,
+}
+
+impl RwkvHistoricalReviews {
+    fn walk(
+        self,
+        mut visit: impl FnMut(RwkvHistoricalFingerprintReview, [u8; 32], bool),
+    ) -> Result<RwkvHistoricalReviewFingerprintResponse> {
+        let started = std::time::Instant::now();
+        let RwkvHistoricalReviews {
+            input,
+            options,
+            ignored_review_ids,
+            rows,
+            active_ignored_review_ids,
+            timing,
+            stable_preset_ids_by_card,
+            preset_routes,
+            decks_by_id,
+            configs_by_id,
+        } = self;
+        let queried_review_count = rows.len() as u64;
+        let checkpoint_review_count = options.recovery_checkpoint_max_age_millis.and_then(|age| {
+            let cutoff = rows.last()?.review_id - age;
+            // Match the desktop checkpoint: retain at least one review in the
+            // prefix, and leave at least one review for recovery replay.
+            let count = rows.partition_point(|row| row.review_id <= cutoff).max(1);
+            (count < rows.len()).then_some(count)
+        });
 
         let mut previous_review_id_by_card = HashMap::new();
         let mut previous_interval_days_by_card = HashMap::new();
@@ -230,7 +288,9 @@ impl Collection {
             history_prefix_is_valid,
         })
     }
+}
 
+impl Collection {
     fn rwkv_historical_preset_routes(
         &mut self,
         included_card_ids: &HashSet<CardId>,
