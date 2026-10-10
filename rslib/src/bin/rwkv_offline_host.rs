@@ -254,6 +254,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let answers = args.get(6).map_or(Ok(30), |n| n.parse())?;
         return lag_check(col, deck, now, answers);
     }
+    if args.get(4).map(String::as_str) == Some("probe") {
+        let deck: i64 = args[5].parse()?;
+        // rating for each answer: 1 Again, 3 Good (default)
+        let rating: i32 = args.get(6).map_or(Ok(3), |n| n.parse())?;
+        return probe_check(col, deck, now, rating);
+    }
     if args.get(4).map(String::as_str) == Some("answer") {
         answer_check(col, &args[1], &args[2], now)?;
     }
@@ -536,5 +542,89 @@ fn lag_check(
     let start = Instant::now();
     DecksService::deck_tree(&mut col, DeckTreeRequest { now: now + 30 })?;
     println!("LAG deck list after: {} ms", start.elapsed().as_millis());
+    Ok(())
+}
+
+fn tree_review_count(node: &anki_proto::decks::DeckTreeNode, deck: i64) -> Option<u32> {
+    if node.deck_id == deck {
+        return Some(node.review_count);
+    }
+    node.children
+        .iter()
+        .find_map(|child| tree_review_count(child, deck))
+}
+
+/// The deck list's review count for `deck` next to what the study queue
+/// holds, before each answer (real time, 2 s apart), until the queue is empty.
+fn probe_check(
+    mut col: anki::collection::Collection,
+    deck: i64,
+    _now: i64,
+    rating: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    col.set_current_deck(anki::decks::DeckId(deck))?;
+    let request = anki_proto::scheduler::GetQueuedCardsRequest {
+        fetch_limit: 1,
+        ..Default::default()
+    };
+    for index in 0..40 {
+        let now = anki::timestamp::TimestampSecs::now().0;
+        let start = Instant::now();
+        let tree = DecksService::deck_tree(&mut col, DeckTreeRequest { now })?;
+        let tree_ms = start.elapsed().as_millis();
+        let start = Instant::now();
+        // the deck list's forecast line (RwkvForecast.kt OFFSETS)
+        SchedulerService::rwkv_offline_forecast(
+            &mut col,
+            RwkvOfflineForecastRequest {
+                search: String::new(),
+                offsets_secs: vec![0, 3600, 3 * 3600, -1],
+            },
+        )?;
+        let forecast_ms = start.elapsed().as_millis();
+        let start = Instant::now();
+        SchedulerService::rwkv_offline_forecast(
+            &mut col,
+            RwkvOfflineForecastRequest {
+                search: String::new(),
+                offsets_secs: vec![0],
+            },
+        )?;
+        println!(
+            "PROBE forecast now only: {} ms",
+            start.elapsed().as_millis()
+        );
+        let listed = tree_review_count(&tree, deck);
+        let start = Instant::now();
+        let queued = SchedulerService::get_queued_cards(&mut col, request.clone())?;
+        let queue_ms = start.elapsed().as_millis();
+        let top = queued.cards.first().map(|c| c.card.as_ref().unwrap().id);
+        println!(
+            "PROBE {index}: deck list {listed:?} ({tree_ms} ms, forecast {forecast_ms} ms) | queue new {} learn {} review {} ({queue_ms} ms) | top {top:?}",
+            queued.new_count, queued.learning_count, queued.review_count
+        );
+        let Some(card) = queued.cards.first() else {
+            break;
+        };
+        let states = card.states.clone().unwrap();
+        let new_state = if rating == 1 {
+            states.again.clone()
+        } else {
+            states.good.clone()
+        };
+        SchedulerService::answer_card(
+            &mut col,
+            anki_proto::scheduler::CardAnswer {
+                card_id: top.unwrap(),
+                current_state: states.current.clone(),
+                new_state,
+                rating: rating - 1,
+                answered_at_millis: anki::timestamp::TimestampMillis::now().0,
+                milliseconds_taken: 5_000,
+                ..Default::default()
+            },
+        )?;
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
     Ok(())
 }

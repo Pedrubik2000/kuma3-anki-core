@@ -334,10 +334,14 @@ impl Collection {
         &mut self,
         input: RwkvReviewInputRowsForCardsRequest,
     ) -> Result<RwkvReviewInputRowsForCardsResponse> {
-        let card_ids: Vec<CardId> = input.card_ids.into_iter().map(Into::into).collect();
+        let mut card_ids: Vec<CardId> = input.card_ids.into_iter().map(Into::into).collect();
         if card_ids.is_empty() {
             return Ok(RwkvReviewInputRowsForCardsResponse::default());
         }
+        // search_cids is unique: a repeated id (e.g. a just-answered card that
+        // is also among an approximate update's top cards) would fail the query
+        let mut seen = HashSet::new();
+        card_ids.retain(|id| seen.insert(*id));
 
         let timing = self.timing_today()?;
         let decks_by_id = self.storage.get_decks_map()?;
@@ -1635,6 +1639,16 @@ mod test {
             })?;
         assert_eq!(included.loaded_cards, 1);
         assert_eq!(included.rows.len(), 1);
+
+        // kuma3: an approximate queue update can ask for an answered card twice
+        let repeated =
+            col.rwkv_review_input_rows_for_cards(RwkvReviewInputRowsForCardsRequest {
+                card_ids: vec![card.id.0, card.id.0],
+                include_suspended_review: false,
+                include_disabled_decks: true,
+                include_new_cards: false,
+            })?;
+        assert_eq!(repeated.rows.len(), 1);
 
         Ok(())
     }
