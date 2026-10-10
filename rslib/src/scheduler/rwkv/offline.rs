@@ -21,6 +21,7 @@
 //! that came after it, instead of the whole history.
 
 use std::fmt;
+use std::hash::Hasher;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -33,7 +34,6 @@ use anki_proto::scheduler::rwkv_historical_review_inputs_response::Review;
 use anki_proto::scheduler::rwkv_offline_forecast_response::Card as ForecastCard;
 use anki_proto::scheduler::rwkv_review_input_rows_for_cards_response::Row;
 use anki_proto::scheduler::RwkvHistoricalReviewIdentity;
-use anki_proto::scheduler::RwkvHistoricalReviewInputsRequest;
 use anki_proto::scheduler::RwkvOfflineForecastRequest;
 use anki_proto::scheduler::RwkvOfflineForecastResponse;
 use anki_proto::scheduler::RwkvOfflineInstantPassProgress;
@@ -50,6 +50,8 @@ use crate::collection::RwkvReviewQueueScoreEntry;
 use crate::decks::limits::LimitTreeMap;
 use crate::rwkv::ReviewInput;
 use crate::rwkv::RwkvInference;
+use crate::scheduler::fsrs::preset::FsrsPresetOverlay;
+use crate::scheduler::fsrs::preset::FSRS_PRESET_OVERLAY_CONFIG_KEY;
 use crate::scheduler::states::CardState;
 use crate::scheduler::states::NormalState;
 
@@ -102,6 +104,34 @@ struct HistoryPlan {
     /// The history identity once replayed.
     identity: RwkvHistoricalReviewIdentity,
     collection_mod: TimestampMillis,
+    /// What the history was read under ([ReplayStamp]), if known.
+    stamp: Option<ReplayStamp>,
+}
+
+/// A cheap summary of everything the history replay reads besides the
+/// reviews' own fields: when it is unchanged after a change to the collection
+/// (deck options, a note edit), the history is too, and the fingerprint pass
+/// over every review (~20 s for 3.7M reviews on a Pixel 8a, holding the
+/// collection) is skipped. None when the collection has preset overlay rules,
+/// which match cards by search: then the full check runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ReplayStamp {
+    revlog_rows: u64,
+    last_review_id: i64,
+    /// Cards (id, note, home deck), each deck's options group, the options
+    /// groups, the day boundary and the dynamic preset setting.
+    rest: u64,
+}
+
+impl ReplayStamp {
+    /// The stamp after one answer was added (an answer moves no card).
+    fn appended(self, review_id: i64) -> Self {
+        Self {
+            revlog_rows: self.revlog_rows + 1,
+            last_review_id: self.last_review_id.max(review_id),
+            ..self
+        }
+    }
 }
 
 pub(crate) struct RwkvOfflineRuntime {
@@ -113,6 +143,8 @@ pub(crate) struct RwkvOfflineRuntime {
     identity: Option<RwkvHistoricalReviewIdentity>,
     /// Collection modification time when the history was last checked.
     checked_at_mod: Option<TimestampMillis>,
+    /// The [ReplayStamp] the history was last checked under (with an identity).
+    checked_stamp: Option<ReplayStamp>,
     /// Bumped whenever the model state changes; invalidates cached scores.
     generation: u64,
     scopes: HashMap<DeckId, ScopeScores>,
@@ -171,6 +203,7 @@ impl RwkvOfflineRuntime {
             initial_cache_state,
             identity: None,
             checked_at_mod: None,
+            checked_stamp: None,
             generation: 0,
             scopes: HashMap::new(),
             saved_review_count: None,
@@ -265,6 +298,7 @@ impl RwkvOfflineRuntime {
         let review_count = plan.identity.review_count;
         self.identity = Some(plan.identity);
         self.checked_at_mod = Some(plan.collection_mod);
+        self.checked_stamp = plan.stamp;
         if plan.reset {
             self.state_changed();
         } else {
@@ -344,6 +378,7 @@ fn release_freed_memory() {
 fn history_plan(
     history: RwkvHistoricalReviews,
     collection_mod: TimestampMillis,
+    stamp: Option<ReplayStamp>,
 ) -> Result<Option<HistoryPlan>> {
     let expected = history.input.expected_identity.clone();
     let mut reviews = Vec::with_capacity(history.rows.len());
@@ -370,6 +405,7 @@ fn history_plan(
             history_hash: fingerprint.history_hash,
         },
         collection_mod,
+        stamp,
     }))
 }
 
@@ -911,7 +947,13 @@ impl Collection {
         if runtime.identity.is_some() && runtime.checked_at_mod == Some(collection_mod) {
             return Ok(0);
         }
-        match self.rwkv_offline_history_plan(runtime.identity.as_ref(), collection_mod)? {
+        let stamp = self.rwkv_offline_replay_stamp()?;
+        if runtime.identity.is_some() && stamp.is_some() && stamp == runtime.checked_stamp {
+            // Only what the replay doesn't read changed (deck options, notes).
+            runtime.checked_at_mod = Some(collection_mod);
+            return Ok(0);
+        }
+        match self.rwkv_offline_history_plan(runtime.identity.as_ref(), collection_mod, stamp)? {
             Some(plan) if plan.reset && runtime.identity.is_some() => {
                 // The history changed under the state (an undo, a full sync):
                 // replaying all of it here would hold the collection, close to a
@@ -924,6 +966,7 @@ impl Collection {
             Some(plan) => runtime.apply_history_plan(plan, &self.rwkv_offline_state_path()),
             None => {
                 runtime.checked_at_mod = Some(collection_mod);
+                runtime.checked_stamp = stamp;
                 Ok(0)
             }
         }
@@ -943,6 +986,69 @@ impl Collection {
             dynamic_preset_replay,
             ..Default::default()
         })
+    }
+
+    /// See [ReplayStamp].
+    fn rwkv_offline_replay_stamp(&mut self) -> Result<Option<ReplayStamp>> {
+        if self
+            .get_config_optional::<FsrsPresetOverlay, _>(FSRS_PRESET_OVERLAY_CONFIG_KEY)
+            .is_some_and(|overlay| !overlay.rules.is_empty() || !overlay.simulator_rules.is_empty())
+        {
+            return Ok(None);
+        }
+        // ponytail: a review edited in place (same count and newest id) isn't
+        // seen; nothing on the phone does that. Hash the rows if something does.
+        let (revlog_rows, last_review_id) = self.storage.db.query_row(
+            "select count(), coalesce(max(id), 0) from revlog",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut hash = fnv::FnvHasher::default();
+        {
+            let mut cards = self.storage.db.prepare(
+                "select id, nid, case when odid != 0 then odid else did end from cards order by id",
+            )?;
+            let mut rows = cards.query([])?;
+            while let Some(row) = rows.next()? {
+                for column in 0..3 {
+                    hash.write_i64(row.get(column)?);
+                }
+            }
+        }
+        let mut decks: Vec<_> = self
+            .storage
+            .get_decks_map()?
+            .into_values()
+            .map(|deck| (deck.id.0, deck.config_id().map_or(-1, |id| id.0)))
+            .collect();
+        decks.sort_unstable();
+        let mut configs: Vec<_> = self
+            .storage
+            .all_deck_config()?
+            .into_iter()
+            .map(|config| config.id.0)
+            .collect();
+        configs.sort_unstable();
+        hash.write_usize(decks.len());
+        for (deck, config) in decks {
+            hash.write_i64(deck);
+            hash.write_i64(config);
+        }
+        hash.write_usize(configs.len());
+        for config in configs {
+            hash.write_i64(config);
+        }
+        // The day boundary as Clanki keys it: the same on every day, and all
+        // the replay's day numbers depend on.
+        let timing = self.timing_today()?;
+        hash.write_i64(timing.next_day_at.0.rem_euclid(86_400));
+        hash.write_i64(timing.days_elapsed as i64 - timing.next_day_at.0.div_euclid(86_400));
+        hash.write_u8(self.rwkv_offline_history_request()?.dynamic_preset_replay as u8);
+        Ok(Some(ReplayStamp {
+            revlog_rows,
+            last_review_id,
+            rest: hash.finish(),
+        }))
     }
 
     /// Appends the answer to `card_id` to the model state, when nothing else
@@ -973,6 +1079,9 @@ impl Collection {
                 reviews: vec![answered_input(&review)],
                 identity,
                 collection_mod,
+                stamp: runtime
+                    .checked_stamp
+                    .map(|stamp| stamp.appended(review.review_id)),
             },
             &self.rwkv_offline_state_path(),
         )?;
@@ -985,41 +1094,12 @@ impl Collection {
         &mut self,
         absorbed: Option<&RwkvHistoricalReviewIdentity>,
         collection_mod: TimestampMillis,
+        stamp: Option<ReplayStamp>,
     ) -> Result<Option<HistoryPlan>> {
-        let mut history = self.rwkv_offline_history_request()?;
-
-        let mut kept = 0;
-        if let Some(identity) = absorbed.filter(|id| id.review_count > 0) {
-            history.expected_identity = Some(identity.clone());
-            let fingerprint = self.rwkv_historical_review_fingerprint(history.clone())?;
-            history.expected_identity = None;
-            if fingerprint.history_is_valid {
-                return Ok(None);
-            }
-            if fingerprint.history_prefix_is_valid {
-                kept = identity.review_count as usize;
-            }
-        }
-
-        let response = self.rwkv_historical_review_inputs(RwkvHistoricalReviewInputsRequest {
-            history: Some(history),
-            ..Default::default()
-        })?;
-        if kept > response.reviews.len() {
-            kept = 0;
-        }
-        Ok(Some(HistoryPlan {
-            reset: kept == 0,
-            reviews: response.reviews[kept..]
-                .iter()
-                .map(answered_input)
-                .collect(),
-            identity: response
-                .metadata
-                .and_then(|metadata| metadata.identity)
-                .unwrap_or_default(),
-            collection_mod,
-        }))
+        let mut request = self.rwkv_offline_history_request()?;
+        request.expected_identity = absorbed.filter(|id| id.review_count > 0).cloned();
+        let history = self.read_rwkv_historical_reviews(request, Default::default())?;
+        history_plan(history, collection_mod, stamp)
     }
 
     /// Starts loading the runtime (state file, then any replay) on its own
@@ -1047,6 +1127,7 @@ impl Collection {
         // check against the state file, the replay inputs) is done on the
         // thread: it held the collection ~22 s for a 4M-review history on a
         // Pixel 8a, and the app's main thread waits for the open.
+        let stamp = self.rwkv_offline_replay_stamp()?;
         let mut request = self.rwkv_offline_history_request()?;
         request.expected_identity = planned_for.clone().filter(|id| id.review_count > 0);
         let history = self.read_rwkv_historical_reviews(request, Default::default())?;
@@ -1056,7 +1137,7 @@ impl Collection {
             .saturating_sub(planned_for.as_ref().map_or(0, |id| id.review_count));
         let handle = std::thread::spawn(move || -> Result<Box<RwkvOfflineRuntime>> {
             let started = Instant::now();
-            let plan = history_plan(history, collection_mod)?;
+            let plan = history_plan(history, collection_mod, stamp)?;
             let mut runtime = RwkvOfflineRuntime::load_with_saved_state(model_path, &state_path)?;
             // A file that changed since the plan was made is left to the
             // history sync after install.
@@ -1065,7 +1146,10 @@ impl Collection {
                     Some(plan) => {
                         runtime.apply_history_plan(plan, &state_path)?;
                     }
-                    None => runtime.checked_at_mod = Some(collection_mod),
+                    None => {
+                        runtime.checked_at_mod = Some(collection_mod);
+                        runtime.checked_stamp = stamp;
+                    }
                 }
             }
             tracing::info!(
@@ -1355,5 +1439,101 @@ impl Collection {
             }
         }
         Ok(scored)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::revlog::RevlogEntry;
+    use crate::revlog::RevlogReviewKind;
+    use crate::scheduler::fsrs::preset::AddonFsrsPreset;
+    use crate::scheduler::fsrs::preset::AddonFsrsVersion;
+    use crate::scheduler::fsrs::preset::FsrsPresetRule;
+    use crate::tests::CardAdder;
+    use crate::tests::DeckAdder;
+
+    fn add_review(col: &mut Collection, card_id: CardId, id: i64) {
+        col.storage
+            .add_revlog_entry(
+                &RevlogEntry {
+                    id: RevlogId(id),
+                    cid: card_id,
+                    button_chosen: 3,
+                    review_kind: RevlogReviewKind::Learning,
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn replay_stamp_changes_only_with_what_the_replay_reads() -> Result<()> {
+        let mut col = Collection::new();
+        let deck = DeckAdder::new("deck").add(&mut col);
+        let other = DeckAdder::new("other").with_config(|_| {}).add(&mut col);
+        let card = CardAdder::new().deck(deck.id).add(&mut col)[0].id;
+        add_review(&mut col, card, 1_000_000);
+        let stamp = col.rwkv_offline_replay_stamp()?.unwrap();
+
+        // deck options that the replay doesn't read
+        let mut config = col.get_deck_config(DeckConfigId(1), false)?.unwrap();
+        config.inner.learn_steps = vec![2.0, 20.0];
+        col.add_or_update_deck_config(&mut config)?;
+        assert_eq!(col.rwkv_offline_replay_stamp()?, Some(stamp));
+
+        // an answer: what absorbing it assumes
+        add_review(&mut col, card, 2_000_000);
+        let stamp = stamp.appended(2_000_000);
+        assert_eq!(col.rwkv_offline_replay_stamp()?, Some(stamp));
+
+        // a card moved to a deck with another preset
+        col.set_deck(&[card], other.id)?;
+        let moved = col.rwkv_offline_replay_stamp()?.unwrap();
+        assert_ne!(moved, stamp);
+
+        // a deck switched to another preset
+        let mut deck = col.storage.get_deck(deck.id)?.unwrap();
+        deck.normal_mut()?.config_id = other.config_id().unwrap().0;
+        col.add_or_update_deck(&mut deck)?;
+        let switched = col.rwkv_offline_replay_stamp()?.unwrap();
+        assert_ne!(switched, moved);
+
+        // "Next day starts at"
+        col.set_v2_rollover(9)?;
+        assert_ne!(col.rwkv_offline_replay_stamp()?.unwrap(), switched);
+
+        // a deleted review
+        col.storage
+            .db
+            .execute("delete from revlog where id = 1000000", [])?;
+        assert_ne!(
+            col.rwkv_offline_replay_stamp()?.unwrap().revlog_rows,
+            stamp.revlog_rows
+        );
+
+        // preset overlay rules match cards by search: always the full check
+        col.set_config(
+            FSRS_PRESET_OVERLAY_CONFIG_KEY,
+            &FsrsPresetOverlay {
+                presets: vec![AddonFsrsPreset {
+                    id: "addon:x".into(),
+                    name: "x".into(),
+                    fsrs_version: AddonFsrsVersion::Six,
+                    params: vec![1.0; 21],
+                    desired_retention: 0.9,
+                    historical_retention: 0.9,
+                    ..Default::default()
+                }],
+                rules: vec![FsrsPresetRule {
+                    search: "deck:other".into(),
+                    preset_id: "addon:x".into(),
+                }],
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(col.rwkv_offline_replay_stamp()?, None);
+        Ok(())
     }
 }
