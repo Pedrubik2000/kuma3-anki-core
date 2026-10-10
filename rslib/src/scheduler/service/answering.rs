@@ -41,6 +41,16 @@ impl From<anki_proto::scheduler::card_answer::Rating> for Rating {
     }
 }
 
+impl From<crate::scheduler::queue::QueueEntryKind> for anki_proto::scheduler::queued_cards::Queue {
+    fn from(kind: crate::scheduler::queue::QueueEntryKind) -> Self {
+        match kind {
+            crate::scheduler::queue::QueueEntryKind::New => Self::New,
+            crate::scheduler::queue::QueueEntryKind::Review => Self::Review,
+            crate::scheduler::queue::QueueEntryKind::Learning => Self::Learning,
+        }
+    }
+}
+
 impl From<QueuedCard> for anki_proto::scheduler::queued_cards::QueuedCard {
     fn from(queued_card: QueuedCard) -> Self {
         Self {

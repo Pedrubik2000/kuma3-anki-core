@@ -349,6 +349,17 @@ impl crate::services::SchedulerService for Collection {
         .map(Into::into)
     }
 
+    fn get_deck_queue(&mut self, input: anki_proto::decks::DeckId) -> Result<scheduler::DeckQueue> {
+        let queue = self.deck_queue(DeckId(input.did))?;
+        Ok(scheduler::DeckQueue {
+            card_ids: queue.iter().map(|(id, _)| id.0).collect(),
+            queues: queue
+                .iter()
+                .map(|(_, kind)| scheduler::queued_cards::Queue::from(*kind) as i32)
+                .collect(),
+        })
+    }
+
     fn rebuild_queued_cards_preserving_current_card(
         &mut self,
         input: cards::CardId,

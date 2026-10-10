@@ -27,6 +27,9 @@ service SchedulerService {
   rpc UpdateStats(UpdateStatsRequest) returns (generic.Empty);
   rpc ExtendLimits(ExtendLimitsRequest) returns (generic.Empty);
   rpc CountsForDeckToday(decks.DeckId) returns (CountsForDeckTodayResponse);
+  // kuma3: the cards a deck's study queue would show today, built without
+  // selecting the deck (no "Select Deck" undo step, Undo kept).
+  rpc GetDeckQueue(decks.DeckId) returns (DeckQueue);
   rpc CongratsInfo(generic.Empty) returns (CongratsInfoResponse);
   rpc RestoreBuriedAndSuspendedCards(cards.CardIds)
       returns (collection.OpChanges);
@@ -253,6 +256,11 @@ message QueuedCards {
   uint32 new_count = 2;
   uint32 learning_count = 3;
   uint32 review_count = 4;
+}
+
+message DeckQueue {
+  repeated int64 card_ids = 1;
+  repeated QueuedCards.Queue queues = 2;
 }
 
 message GetQueuedCardsRequest {

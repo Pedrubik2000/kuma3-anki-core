@@ -445,6 +445,18 @@ impl Collection {
         Ok(self.state.card_queues.as_mut().unwrap())
     }
 
+    /// kuma3: the cards [deck_id]'s study queue would show today (RWKV-Instant
+    /// and the daily limits, as studying it builds it), built on the side
+    /// for kumapie (kuma3/due). The current deck and Undo are left alone:
+    /// selecting each deck to read its queue was a "Select Deck" undo step,
+    /// and the day's first queue read discards Undo. The deck list
+    /// (deck_due_tree) unburies on a new day, so call it first.
+    pub fn deck_queue(&mut self, deck_id: DeckId) -> Result<Vec<(CardId, QueueEntryKind)>> {
+        self.rwkv_offline_before_queue_build(deck_id);
+        let queues = self.build_queues(deck_id)?;
+        Ok(queues.iter().map(|e| (e.card_id(), e.kind())).collect())
+    }
+
     // Returns queues if they are valid and have not been rebuilt. If build time has
     // changed, they are cleared.
     pub(crate) fn get_or_invalidate_queues(
@@ -641,5 +653,45 @@ mod tests {
         fn again_on_the_last_review_card() -> Result<()> {
             again_at(true, 2)
         }
+    }
+
+    /// kumapie's kuma3/due: another deck's queue without selecting it, and Undo
+    /// still undoes the last answer.
+    #[test]
+    fn deck_queue_leaves_current_deck_and_undo() -> Result<()> {
+        use crate::tests::DeckAdder;
+        use crate::tests::NoteAdder;
+        let mut col = Collection::new();
+        let other = DeckAdder::new("other").add(&mut col);
+        for _ in 0..2 {
+            NoteAdder::basic(&mut col).add(&mut col);
+        }
+        for _ in 0..3 {
+            NoteAdder::basic(&mut col).deck(other.id).add(&mut col);
+        }
+        col.answer_good();
+        let current = col.get_current_deck_id();
+        let undo = col.undo_status().undo;
+        assert!(undo.is_some());
+
+        let queue = col.deck_queue(other.id)?;
+        assert_eq!(queue.len(), 3);
+        assert!(queue.iter().all(|(_, kind)| *kind == QueueEntryKind::New));
+        assert_eq!(col.get_current_deck_id(), current);
+        assert_eq!(col.undo_status().undo, undo);
+
+        // the same cards as selecting the deck and reading its queue
+        col.set_current_deck(other.id)?;
+        let selected: Vec<_> = col
+            .get_queued_cards(100, false, true)?
+            .cards
+            .iter()
+            .map(|c| c.card.id)
+            .collect();
+        assert_eq!(
+            queue.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            selected
+        );
+        Ok(())
     }
 }
